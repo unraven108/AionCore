@@ -13,6 +13,7 @@ use crate::runtime_state::ConversationRuntimeStateService;
 use crate::service::ConversationService;
 use crate::stream_persistence::{
     PersistedTextSegment, StreamPersistenceAdapter, TextSegmentState, ThinkingSegmentState,
+    TurnUsageEntry, TurnUsageSummary,
 };
 use aionui_db::IConversationRepository;
 use aionui_realtime::EventBroadcaster;
@@ -73,12 +74,125 @@ impl SupersedingTipTotals {
     }
 }
 
+/// Accumulates ACP `usage_update` frames for one relay turn.
+///
+/// CodeBuddy reports per-response credits (`cost.amount`) plus a
+/// `_meta["codebuddy.ai/messageId"]`; the same message may re-report its
+/// credit on several frames, so entries are deduplicated by message id before
+/// summing. Re-reports update the entry in place with the richest figures
+/// seen: the cost-bearing frame can arrive after an earlier sizeless one,
+/// and first-wins dedupe would otherwise pin the turn's credit to zero.
+/// Other ACP agents (claude-style cumulative cost, hermes without
+/// cost) fall back to keeping the last frame only — summing there would
+/// double-count a cumulative figure.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct TurnUsageAccumulator {
+    credit: f64,
+    currency: String,
+    tokens: u64,
+    entries: Vec<TurnUsageEntry>,
+}
+
+impl TurnUsageAccumulator {
+    pub(crate) fn apply(&mut self, frame: &serde_json::Value) {
+        let cost_amount = frame
+            .get("cost")
+            .and_then(|c| c.get("amount"))
+            .and_then(serde_json::Value::as_f64);
+        let cost_currency = frame
+            .get("cost")
+            .and_then(|c| c.get("currency"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let meta = frame.get("_meta");
+        let usage = meta.and_then(|m| m.get("usage"));
+        let message_id = meta
+            .and_then(|m| m.get("codebuddy.ai/messageId"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned);
+        let usage_credit = usage
+            .and_then(|u| u.get("credit"))
+            .and_then(serde_json::Value::as_f64);
+        let total_tokens = usage
+            .and_then(|u| u.get("total_tokens"))
+            .and_then(serde_json::Value::as_u64);
+
+        match message_id {
+            Some(id) => {
+                let credit = usage_credit.unwrap_or(cost_amount.unwrap_or(0.0));
+                if let Some(entry) = self
+                    .entries
+                    .iter_mut()
+                    .find(|e| e.message_id.as_deref() == Some(id.as_str()))
+                {
+                    // Re-report of the same message id: keep the richest
+                    // figures. The final cost-bearing frame can arrive after
+                    // an earlier sizeless one; first-wins dedupe would pin
+                    // credit to zero and hide the chips for the whole turn.
+                    if credit > entry.credit {
+                        self.credit += credit - entry.credit;
+                        entry.credit = credit;
+                    }
+                    if let Some(new) = total_tokens {
+                        match entry.tokens {
+                            Some(old) if new > old => {
+                                self.tokens += new - old;
+                                entry.tokens = Some(new);
+                            }
+                            None => {
+                                self.tokens += new;
+                                entry.tokens = Some(new);
+                            }
+                            _ => {}
+                        }
+                    }
+                    return;
+                }
+                let tokens = total_tokens.unwrap_or(0);
+                self.credit += credit;
+                self.tokens += tokens;
+                self.entries.push(TurnUsageEntry {
+                    credit,
+                    tokens: total_tokens,
+                    message_id: Some(id),
+                });
+            }
+            None => {
+                let Some(amount) = cost_amount else {
+                    return;
+                };
+                self.credit = amount;
+                self.currency = cost_currency.to_owned();
+                self.tokens = total_tokens.unwrap_or(0);
+                self.entries = vec![TurnUsageEntry {
+                    credit: amount,
+                    tokens: total_tokens,
+                    message_id: None,
+                }];
+            }
+        }
+    }
+
+    pub(crate) fn finish(&self, duration_ms: u64) -> Option<TurnUsageSummary> {
+        if self.entries.is_empty() {
+            return None;
+        }
+        Some(TurnUsageSummary {
+            credit: self.credit,
+            currency: self.currency.clone(),
+            tokens: self.tokens,
+            duration_ms,
+            entries: self.entries.clone(),
+        })
+    }
+}
+
 /// Compact, locale-neutral duration: `45s`, `7m41s`, `1h02m`.
 fn humanize_ms(ms: i64) -> String {
     let total = (ms.max(0) / 1000) as u64;
     match (total / 3600, (total % 3600) / 60, total % 60) {
-        (0, 0, s) => format!("{s}s"),
-        (0, m, s) => format!("{m}m{s:02}s"),
+        (0, 0, s) => format!("{s}s"),        (0, m, s) => format!("{m}m{s:02}s"),
         (h, m, _) => format!("{h}h{m:02}m"),
     }
 }
@@ -304,6 +418,7 @@ impl StreamRelay {
         let mut send_error_done = send_error_rx.is_none();
         let mut pending_send_error: Option<AgentSendError> = None;
         let mut attempt = TurnAttemptSummary::default();
+        let mut usage_accumulator = TurnUsageAccumulator::default();
 
         loop {
             let recv_result = if send_error_done {
@@ -561,7 +676,9 @@ impl StreamRelay {
                                     attempt: attempt.clone(),
                                 }
                             } else {
-                                self.finalize(&full_text_buffer, &text_segments, &event, terminal).await
+                                let usage = usage_accumulator.finish(elapsed_ms as u64);
+                                self.finalize(&full_text_buffer, &text_segments, &event, terminal, usage)
+                                    .await
                             };
                             outcome.attempt = attempt.clone();
                             if !full_text_buffer.is_empty() {
@@ -715,6 +832,13 @@ impl StreamRelay {
                             self.forward_to_websocket(&event);
                             self.adapter.persist_plan(data, &self.turn_id).await;
                         }
+                        AgentStreamEvent::AcpContextUsage(value) => {
+                            // Also consumed by the usage accumulator: the frame
+                            // is forwarded live as before, and the turn total is
+                            // attached to the last text message at finalize.
+                            usage_accumulator.apply(value);
+                            self.forward_to_websocket(&event);
+                        }
                         _ => {
                             self.forward_to_websocket(&event);
                         }
@@ -755,11 +879,13 @@ impl StreamRelay {
                             attempt: attempt.clone(),
                         }
                     } else {
+                        let usage = usage_accumulator.finish(elapsed_ms as u64);
                         self.finalize(
                             &full_text_buffer,
                             &text_segments,
                             &AgentStreamEvent::Finish(aionui_ai_agent::protocol::events::FinishEventData::default()),
                             RelayTerminal::ChannelClosed,
+                            usage,
                         )
                         .await
                     };
@@ -885,6 +1011,7 @@ impl StreamRelay {
         text_segments: &[PersistedTextSegment],
         event: &AgentStreamEvent,
         terminal: RelayTerminal,
+        usage: Option<TurnUsageSummary>,
     ) -> RelayOutcome {
         let mut outcome = RelayOutcome {
             system_responses: Vec::new(),
@@ -908,6 +1035,23 @@ impl StreamRelay {
                 .await;
             for override_event in overrides {
                 self.send_final_text_override(&override_event.msg_id, &override_event.text, override_event.hidden);
+            }
+
+            // Attach the turn's aggregated usage to the message the frontend
+            // renders as the turn's tail (the copy row sits on the last text).
+            // When middleware rewrote the reply into the primary segment, the
+            // other segments are hidden — attach there instead.
+            if let (Some(usage), Some(target)) = (
+                usage,
+                if rewrite_segments {
+                    text_segments.first()
+                } else {
+                    text_segments.last()
+                },
+            ) {
+                self.adapter
+                    .attach_turn_usage(&target.id, &target.text, &usage)
+                    .await;
             }
 
             self.send_system_responses(&processed.system_responses);
@@ -2487,6 +2631,151 @@ mod tests {
         assert_eq!(content["content"], "partial");
     }
 
+    fn codebuddy_usage_frame(credit: f64, total_tokens: u64, message_id: &str) -> AgentStreamEvent {
+        AgentStreamEvent::AcpContextUsage(json!({
+            "used": 86095,
+            "size": 1000000,
+            "cost": { "amount": credit, "currency": "" },
+            "_meta": {
+                "codebuddy.ai/messageId": message_id,
+                "usage": { "total_tokens": total_tokens, "credit": credit },
+            },
+        }))
+    }
+
+    #[tokio::test]
+    async fn attaches_aggregated_turn_usage_to_last_text_segment() {
+        let repo = Arc::new(RecordingRepo::new());
+        let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
+        let (tx, _) = broadcast::channel(64);
+
+        let relay = StreamRelay::new(
+            "conv-1".into(),
+            "asst-1".into(),
+            "turn-1".into(),
+            "user-1".into(),
+            repo.clone(),
+            bus.clone(),
+        );
+        let rx = tx.subscribe();
+
+        tx.send(AgentStreamEvent::Text(TextEventData {
+            content: "Final answer".into(),
+        }))
+        .unwrap();
+        // Two model responses; the first re-reports the same messageId once.
+        tx.send(codebuddy_usage_frame(0.04, 24_018, "mid-1")).unwrap();
+        tx.send(codebuddy_usage_frame(0.04, 24_018, "mid-1")).unwrap();
+        tx.send(codebuddy_usage_frame(0.02, 1_000, "mid-2")).unwrap();
+        // Deliver Finish after a small delay so the relay's turn clock has
+        // real elapsed time. Sending everything before consume() starts
+        // would let the whole drain finish within one millisecond and flake
+        // the `duration_ms > 0` assertion below.
+        {
+            let finish_tx = tx.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                let _ = finish_tx.send(AgentStreamEvent::Finish(FinishEventData::default()));
+            });
+        }
+
+        relay.consume(rx).await;
+
+        let updates = repo.take_updates();
+        let usage_update = updates
+            .iter()
+            .find(|(_, u)| u.content.as_deref().is_some_and(|c| c.contains("\"usage\"")))
+            .expect("a usage attach update must target the turn's last text segment");
+        let content: serde_json::Value = serde_json::from_str(usage_update.1.content.as_deref().unwrap()).unwrap();
+        assert_eq!(content["content"], "Final answer");
+        let usage = &content["usage"];
+        assert!((usage["credit"].as_f64().unwrap() - 0.06).abs() < 1e-9);
+        assert_eq!(usage["currency"], "");
+        assert_eq!(usage["tokens"], 25_018);
+        assert!(usage["duration_ms"].as_u64().unwrap() > 0);
+        let entries = usage["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 2, "duplicate messageId must be deduped");
+    }
+
+    #[tokio::test]
+    async fn leaves_text_content_without_usage_when_agent_reports_none() {
+        let repo = Arc::new(RecordingRepo::new());
+        let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
+        let (tx, _) = broadcast::channel(64);
+
+        let relay = StreamRelay::new(
+            "conv-1".into(),
+            "asst-1".into(),
+            "turn-1".into(),
+            "user-1".into(),
+            repo.clone(),
+            bus.clone(),
+        );
+        let rx = tx.subscribe();
+
+        tx.send(AgentStreamEvent::Text(TextEventData {
+            content: "No usage here".into(),
+        }))
+        .unwrap();
+        tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
+
+        relay.consume(rx).await;
+
+        let inserts = repo.take_inserts();
+        let text_row = inserts.iter().find(|m| m.r#type == "text").unwrap();
+        let content: serde_json::Value = serde_json::from_str(&text_row.content).unwrap();
+        assert!(content.get("usage").is_none());
+        let updates = repo.take_updates();
+        assert!(
+            updates.iter().all(|(_, u)| !u.content.as_deref().is_some_and(|c| c.contains("\"usage\""))),
+            "no usage attach update may be issued for a turn without usage frames"
+        );
+    }
+
+    #[test]
+    fn accumulator_keeps_last_frame_for_agents_without_message_id() {
+        let mut accumulator = TurnUsageAccumulator::default();
+        accumulator.apply(&json!({
+            "used": 100,
+            "cost": { "amount": 0.5, "currency": "USD" },
+        }));
+        accumulator.apply(&json!({
+            "used": 200,
+            "cost": { "amount": 0.9, "currency": "USD" },
+            "_meta": { "usage": { "total_tokens": 3_000 } },
+        }));
+        let summary = accumulator.finish(1200).expect("entries present");
+        assert!((summary.credit - 0.9).abs() < 1e-9);
+        assert_eq!(summary.currency, "USD");
+        assert_eq!(summary.tokens, 3_000);
+        assert_eq!(summary.duration_ms, 1200);
+        assert_eq!(summary.entries.len(), 1, "cumulative agents must not be summed");
+    }
+
+    #[test]
+    fn accumulator_updates_in_place_when_codebuddy_re_reports_same_message_id() {
+        let mut accumulator = TurnUsageAccumulator::default();
+        // First frame for the message carries the id but no cost yet — a
+        // first-wins dedupe would pin this entry's credit to zero.
+        accumulator.apply(&json!({
+            "used": 100,
+            "_meta": { "codebuddy.ai/messageId": "mid-1" },
+        }));
+        // Final frame for the same id carries the real figures.
+        accumulator.apply(&json!({
+            "used": 100,
+            "cost": { "amount": 0.5, "currency": "" },
+            "_meta": {
+                "codebuddy.ai/messageId": "mid-1",
+                "usage": { "total_tokens": 3_000, "credit": 0.5 },
+            },
+        }));
+        let summary = accumulator.finish(1200).expect("entries present");
+        assert!((summary.credit - 0.5).abs() < 1e-9);
+        assert_eq!(summary.tokens, 3_000);
+        assert_eq!(summary.entries.len(), 1, "re-report must update in place, not duplicate");
+    }
+
     #[tokio::test]
     async fn run_broadcasts_turn_completed() {
         let repo = Arc::new(RecordingRepo::new());
@@ -3001,6 +3290,7 @@ mod tests {
                 &[],
                 &AgentStreamEvent::Finish(FinishEventData::default()),
                 RelayTerminal::Finish,
+                None,
             )
             .await;
 

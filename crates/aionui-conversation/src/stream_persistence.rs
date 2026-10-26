@@ -48,6 +48,29 @@ pub(crate) struct TextSegmentState {
 #[derive(Debug, Clone)]
 pub(crate) struct PersistedTextSegment {
     pub id: String,
+    pub text: String,
+}
+
+/// Per-response usage entry captured from an ACP `usage_update` frame.
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct TurnUsageEntry {
+    pub credit: f64,
+    pub tokens: Option<u64>,
+    pub message_id: Option<String>,
+}
+
+/// Turn-aggregated usage attached to the turn's last visible text message.
+///
+/// `currency` is empty for CodeBuddy-style credit agents (the amount is then a
+/// credit count, not money); other ACP agents (claude) report a real currency
+/// code and a cumulative cost, in which case only the last frame is kept.
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct TurnUsageSummary {
+    pub credit: f64,
+    pub currency: String,
+    pub tokens: u64,
+    pub duration_ms: u64,
+    pub entries: Vec<TurnUsageEntry>,
 }
 
 #[derive(Debug, Clone)]
@@ -249,7 +272,36 @@ impl StreamPersistenceAdapter {
             }
         }
 
-        Some(PersistedTextSegment { id: segment.id })
+        Some(PersistedTextSegment {
+            id: segment.id,
+            text: segment.buffer,
+        })
+    }
+
+    /// Attach the turn's aggregated usage to a finalized text segment.
+    ///
+    /// The content JSON is rebuilt from the segment text (kept on
+    /// `PersistedTextSegment`) so the `usage` key rides inside the existing
+    /// column — no schema migration. Status/hidden are left untouched; callers
+    /// must pass the segment that `persist_final_text` left visible.
+    #[tracing::instrument(skip_all)]
+    pub async fn attach_turn_usage(&self, segment_id: &str, text: &str, usage: &TurnUsageSummary) {
+        if !self.allows_write(RuntimeWriteKind::TerminalFinalize) {
+            return;
+        }
+        let content = json!({ "content": text, "usage": usage }).to_string();
+        let update = MessageRowUpdate {
+            content: Some(content),
+            status: None,
+            hidden: None,
+        };
+        if let Err(e) = self
+            .repo
+            .update_message(&self.user_id, &self.conversation_id, segment_id, &update)
+            .await
+        {
+            log_persist_error(&e, "Failed to attach turn usage to text segment");
+        }
     }
 
     #[tracing::instrument(skip_all)]
