@@ -1052,6 +1052,7 @@ impl StreamRelay {
                 self.adapter
                     .attach_turn_usage(&target.id, &target.text, &usage)
                     .await;
+                self.send_turn_usage(&target.id, &target.text, &usage);
             }
 
             self.send_system_responses(&processed.system_responses);
@@ -1119,6 +1120,25 @@ impl StreamRelay {
             "type": "content",
             "data": { "content": text },
             "hidden": hidden,
+            "replace": true,
+        }));
+    }
+
+    /// Push the turn's usage into the already-rendered reply.
+    ///
+    /// The usage is persisted onto the message row, but the renderer only
+    /// picks that up when the conversation is refetched on turn completion —
+    /// which is why the chips used to appear a beat after the text settled.
+    /// Sending the same content update with `usage` attached lets the open
+    /// client merge it immediately (see `normalizeTextMessageContentObject`).
+    fn send_turn_usage(&self, msg_id: &str, text: &str, usage: &TurnUsageSummary) {
+        self.broadcast_stream_payload(json!({
+            "conversation_id": self.conversation_id,
+            "msg_id": msg_id,
+            "turn_id": self.turn_id,
+            "type": "content",
+            "data": { "content": text, "usage": usage },
+            "hidden": false,
             "replace": true,
         }));
     }
@@ -2774,6 +2794,48 @@ mod tests {
         assert!((summary.credit - 0.5).abs() < 1e-9);
         assert_eq!(summary.tokens, 3_000);
         assert_eq!(summary.entries.len(), 1, "re-report must update in place, not duplicate");
+    }
+
+    #[tokio::test]
+    async fn usage_rides_the_stream_so_chips_do_not_wait_for_a_refetch() {
+        let repo = Arc::new(RecordingRepo::new());
+        let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
+        let (tx, _) = broadcast::channel(64);
+
+        let relay = StreamRelay::new(
+            "conv-1".into(),
+            "asst-1".into(),
+            "turn-1".into(),
+            "user-1".into(),
+            repo.clone(),
+            bus.clone(),
+        );
+        let mut ws_rx = bus.subscribe();
+        let rx = tx.subscribe();
+
+        tx.send(AgentStreamEvent::Text(TextEventData {
+            content: "Final answer".into(),
+        }))
+        .unwrap();
+        tx.send(codebuddy_usage_frame(0.04, 24_018, "mid-1")).unwrap();
+        tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
+
+        relay.consume(rx).await;
+
+        let mut ws_events = vec![];
+        while let Ok(evt) = ws_rx.try_recv() {
+            ws_events.push(evt);
+        }
+
+        let usage_event = ws_events
+            .iter()
+            .find(|e| e.name == "message.stream" && e.data["type"] == "content" && e.data["data"]["usage"].is_object())
+            .expect("usage must be streamed with the reply, not only written to the row");
+        let usage = &usage_event.data["data"]["usage"];
+        assert!((usage["credit"].as_f64().unwrap() - 0.04).abs() < 1e-9);
+        assert_eq!(usage["tokens"], 24_018);
+        assert_eq!(usage_event.data["replace"], true);
+        assert_eq!(usage_event.data["hidden"], false);
     }
 
     #[tokio::test]
