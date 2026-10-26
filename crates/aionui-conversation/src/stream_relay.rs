@@ -12,8 +12,8 @@ use crate::runtime_persistence::RuntimePersistenceCoordinator;
 use crate::runtime_state::ConversationRuntimeStateService;
 use crate::service::ConversationService;
 use crate::stream_persistence::{
-    PersistedTextSegment, StreamPersistenceAdapter, TextSegmentState, ThinkingSegmentState,
-    TurnUsageEntry, TurnUsageSummary,
+    PersistedTextSegment, StreamPersistenceAdapter, TextSegmentState, ThinkingSegmentState, TurnUsageEntry,
+    TurnUsageSummary,
 };
 use aionui_db::IConversationRepository;
 use aionui_realtime::EventBroadcaster;
@@ -111,9 +111,7 @@ impl TurnUsageAccumulator {
             .and_then(serde_json::Value::as_str)
             .filter(|id| !id.is_empty())
             .map(str::to_owned);
-        let usage_credit = usage
-            .and_then(|u| u.get("credit"))
-            .and_then(serde_json::Value::as_f64);
+        let usage_credit = usage.and_then(|u| u.get("credit")).and_then(serde_json::Value::as_f64);
         let total_tokens = usage
             .and_then(|u| u.get("total_tokens"))
             .and_then(serde_json::Value::as_u64);
@@ -192,7 +190,8 @@ impl TurnUsageAccumulator {
 fn humanize_ms(ms: i64) -> String {
     let total = (ms.max(0) / 1000) as u64;
     match (total / 3600, (total % 3600) / 60, total % 60) {
-        (0, 0, s) => format!("{s}s"),        (0, m, s) => format!("{m}m{s:02}s"),
+        (0, 0, s) => format!("{s}s"),
+        (0, m, s) => format!("{m}m{s:02}s"),
         (h, m, _) => format!("{h}h{m:02}m"),
     }
 }
@@ -1049,9 +1048,7 @@ impl StreamRelay {
                     text_segments.last()
                 },
             ) {
-                self.adapter
-                    .attach_turn_usage(&target.id, &target.text, &usage)
-                    .await;
+                self.adapter.attach_turn_usage(&target.id, &target.text, &usage).await;
                 self.send_turn_usage(&target.id, &target.text, &usage);
             }
 
@@ -2747,7 +2744,9 @@ mod tests {
         assert!(content.get("usage").is_none());
         let updates = repo.take_updates();
         assert!(
-            updates.iter().all(|(_, u)| !u.content.as_deref().is_some_and(|c| c.contains("\"usage\""))),
+            updates
+                .iter()
+                .all(|(_, u)| !u.content.as_deref().is_some_and(|c| c.contains("\"usage\""))),
             "no usage attach update may be issued for a turn without usage frames"
         );
     }
@@ -2793,7 +2792,11 @@ mod tests {
         let summary = accumulator.finish(1200).expect("entries present");
         assert!((summary.credit - 0.5).abs() < 1e-9);
         assert_eq!(summary.tokens, 3_000);
-        assert_eq!(summary.entries.len(), 1, "re-report must update in place, not duplicate");
+        assert_eq!(
+            summary.entries.len(),
+            1,
+            "re-report must update in place, not duplicate"
+        );
     }
 
     #[tokio::test]
