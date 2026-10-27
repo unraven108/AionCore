@@ -136,6 +136,7 @@ impl LoginManager {
                 source: account.source.clone(),
                 is_active: false,
                 is_expired: false,
+                today_credits: 0.0,
             }),
             auth_url: session.auth_url.clone(),
         })

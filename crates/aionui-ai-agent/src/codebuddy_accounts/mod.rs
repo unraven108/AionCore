@@ -20,6 +20,7 @@ pub(crate) mod auth_file;
 mod import;
 mod login;
 mod refresh;
+mod usage;
 
 pub use auth_file::{AuthFileInfo, auth_dir, read_current, scan_history};
 pub use import::{ImportSummary, import_cockpit_export};
@@ -31,7 +32,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 const ACCOUNTS_FILE: &str = "codebuddy-accounts.json";
-const PROFILES_DIR: &str = "codebuddy-accounts";
+pub(crate) const PROFILES_DIR: &str = "codebuddy-accounts";
 const TOKEN_PREVIEW_HEAD: usize = 6;
 const TOKEN_PREVIEW_TAIL: usize = 4;
 
@@ -84,6 +85,8 @@ pub struct AccountView {
     pub source: String,
     pub is_active: bool,
     pub is_expired: bool,
+    /// Credits this account spent since local midnight. `0.0` when unknown.
+    pub today_credits: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -221,6 +224,7 @@ impl CodeBuddyAccountStore {
             source: account.source.clone(),
             is_active: active_id.is_some_and(|id| id == account.id),
             is_expired: account.expires_at.is_some_and(|at| at <= aionui_common::now_ms()),
+            today_credits: 0.0,
         }
     }
 
@@ -236,9 +240,14 @@ impl CodeBuddyAccountStore {
                 .then(right.last_used_at.cmp(&left.last_used_at))
                 .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
         });
+        let today_credits = usage::today_credits_by_account(&self.root);
         let views = accounts
             .iter()
-            .map(|account| self.to_view(account, active_id.as_deref()))
+            .map(|account| {
+                let mut view = self.to_view(account, active_id.as_deref());
+                view.today_credits = today_credits.get(&account.id).copied().unwrap_or(0.0);
+                view
+            })
             .collect();
         (views, active_id)
     }

@@ -18,7 +18,7 @@ const EXTENSION_DIR: &str = "CodeBuddyExtension";
 /// Auth id of the CodeBuddy product (`product.json` → `authentication.id`).
 /// The same directory also holds other products' credentials (WorkBuddy), so
 /// every lookup is restricted to this prefix.
-const AUTH_FILE_PREFIX: &str = "Tencent-Cloud.coding-copilot";
+pub(crate) const AUTH_FILE_PREFIX: &str = "Tencent-Cloud.coding-copilot";
 
 #[derive(Debug, Clone)]
 pub struct AuthFileInfo {
