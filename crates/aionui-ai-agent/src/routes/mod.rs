@@ -10,11 +10,13 @@
 //! they dispatch through `AgentInstance` via `ConversationService`.
 
 pub mod agent;
+pub mod codebuddy;
 pub(crate) mod error_mapping;
 pub mod remote;
 pub mod state;
 
 pub use agent::agent_routes;
+pub use codebuddy::{CodeBuddyRouterState, codebuddy_account_routes};
 pub use remote::remote_agent_routes;
 pub use state::AgentRouterState;
 pub use state::RemoteAgentRouterState;

@@ -29,6 +29,7 @@ hex.workspace = true
 dirs.workspace = true
 getrandom.workspace = true
 regex.workspace = true
+reqwest.workspace = true
 dashmap.workspace = true
 futures-util.workspace = true
 serde.workspace = true

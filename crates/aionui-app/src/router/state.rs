@@ -6,7 +6,10 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use aionui_ai_agent::{AgentRouterState, AgentService, IWorkerTaskManager, RemoteAgentRouterState, RemoteAgentService};
+use aionui_ai_agent::{
+    AgentRouterState, AgentService, CodeBuddyAccountStore, CodeBuddyRouterState, IWorkerTaskManager, LoginManager,
+    RemoteAgentRouterState, RemoteAgentService,
+};
 use aionui_assistant::{
     AssistantAgentCatalogPort, AssistantError, AssistantRouterState, AssistantService, BuiltinAssistantRegistry,
 };
@@ -132,6 +135,7 @@ pub struct ModuleStates {
     pub conversation: ConversationRouterState,
     pub remote_agent: RemoteAgentRouterState,
     pub agent: AgentRouterState,
+    pub codebuddy: CodeBuddyRouterState,
 
     pub connection_test: ConnectionTestRouterState,
     pub file: FileRouterState,
@@ -310,6 +314,10 @@ pub async fn build_module_states(
         agent: build_module_state_phase(&boot, "agent", || AgentRouterState {
             agent_registry: services.agent_registry.clone(),
             service: agent_service,
+        }),
+        codebuddy: build_module_state_phase(&boot, "codebuddy_accounts", || CodeBuddyRouterState {
+            store: Arc::new(CodeBuddyAccountStore::new(services.data_dir.clone())),
+            login: Arc::new(LoginManager::new()),
         }),
         connection_test: build_module_state_phase(&boot, "connection_test", build_connection_test_state),
         file: build_module_state_phase(&boot, "file", || build_file_state(services))?,

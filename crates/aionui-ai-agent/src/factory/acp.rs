@@ -175,6 +175,7 @@ pub(super) async fn build(
         &ctx.user_id,
         &ctx.workspace,
         &ctx.conversation_id,
+        &deps.data_dir,
         deps.broadcaster.clone(),
     )
     .await?;
@@ -354,6 +355,7 @@ async fn resolve_agent_command_spec(
     user_id: &str,
     workspace: &str,
     conversation_id: &str,
+    data_dir: &std::path::Path,
     broadcaster: Arc<dyn aionui_realtime::EventBroadcaster>,
 ) -> Result<CommandSpec, AgentError> {
     let command = meta
@@ -394,6 +396,29 @@ async fn resolve_agent_command_spec(
         name: name.to_string_lossy().into_owned(),
         value: value.to_string_lossy().into_owned(),
     }));
+
+    // CodeBuddy multi-account: the CLI gives `CODEBUDDY_AUTH_TOKEN` the highest
+    // storage priority, so injecting the active account's Bearer token is how a
+    // session runs as a specific account without touching the global auth file.
+    // `CODEBUDDY_CONFIG_DIR` keeps that account's sessions/settings separate.
+    // Pushed last so it beats any manual value in the agent's own env list.
+    if meta.backend.as_deref() == Some("codebuddy") {
+        let accounts = crate::codebuddy_accounts::CodeBuddyAccountStore::new(data_dir);
+        if let Some(account) = accounts.active() {
+            // Renew an expiring credential before handing it to the CLI: the
+            // injected custom token carries no refresh token of its own.
+            let account = crate::codebuddy_accounts::ensure_fresh(&accounts, account).await;
+            let _ = std::fs::create_dir_all(&account.profile_dir);
+            env.push(aionui_common::EnvVar {
+                name: "CODEBUDDY_AUTH_TOKEN".into(),
+                value: account.access_token,
+            });
+            env.push(aionui_common::EnvVar {
+                name: "CODEBUDDY_CONFIG_DIR".into(),
+                value: account.profile_dir,
+            });
+        }
+    }
 
     Ok(CommandSpec {
         command: resolved.program,
@@ -948,6 +973,7 @@ mod tests {
             "user-acp",
             "/tmp/workspace",
             "conv-acp",
+            std::path::Path::new("/tmp"),
             Arc::new(BroadcastEventBus::new(16)),
         )
         .await
@@ -970,6 +996,7 @@ mod tests {
             "user-acp",
             "/tmp/workspace",
             "conv-acp",
+            std::path::Path::new("/tmp"),
             Arc::new(BroadcastEventBus::new(16)),
         )
         .await

@@ -14,7 +14,8 @@ use axum::{Router, middleware};
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 
 use aionui_ai_agent::{
-    RuntimeTokenScope, RuntimeTokenService, TEAM_RUNTIME_TOKEN_SESSION_GENERATION, agent_routes, remote_agent_routes,
+    RuntimeTokenScope, RuntimeTokenService, TEAM_RUNTIME_TOKEN_SESSION_GENERATION, agent_routes,
+    codebuddy_account_routes, remote_agent_routes,
 };
 use aionui_api_types::{ErrorResponse, WebSocketMessage};
 use aionui_assets::{AssetRouterState, asset_routes};
@@ -295,6 +296,10 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     let agent_authenticated =
         agent_routes(states.agent).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
+    // CodeBuddy multi-account library protected by auth middleware
+    let codebuddy_authenticated = codebuddy_account_routes(states.codebuddy)
+        .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
+
     // Connection test routes (Bedrock, Gemini) protected by auth middleware
     let connection_test_authenticated = connection_test_routes(states.connection_test)
         .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
@@ -404,6 +409,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         .merge(conversation_ops_authenticated)
         .merge(remote_agent_authenticated)
         .merge(agent_authenticated)
+        .merge(codebuddy_authenticated)
         .merge(connection_test_authenticated)
         .merge(file_authenticated)
         .merge(project_authenticated)

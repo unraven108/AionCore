@@ -9,6 +9,7 @@ pub mod capability;
 pub mod cc_switch;
 mod claude_flags;
 pub(crate) mod cli_probe;
+pub mod codebuddy_accounts;
 pub(crate) mod dev_prompt_dump;
 pub mod error;
 pub mod factory;
@@ -52,6 +53,7 @@ pub use capability::skill_manager::{
     build_system_instructions_with_skills_index, detect_skill_load_request, prepare_first_message,
     prepare_first_message_with_skills_index,
 };
+pub use codebuddy_accounts::{CodeBuddyAccountStore, LoginManager};
 pub use error::AgentError;
 pub use factory::{AgentFactoryDeps, build_agent_factory};
 pub use idle_scanner::{
@@ -63,7 +65,10 @@ pub use protocol::error::AcpError;
 pub use protocol::events::AgentStreamEvent;
 pub use protocol::send_error::AgentSendError;
 pub use registry::{AgentRegistry, UnavailableReason};
-pub use routes::{AgentRouterState, RemoteAgentRouterState, agent_routes, remote_agent_routes};
+pub use routes::{
+    AgentRouterState, CodeBuddyRouterState, RemoteAgentRouterState, agent_routes, codebuddy_account_routes,
+    remote_agent_routes,
+};
 pub use runtime_token::{
     RuntimeTokenClaims, RuntimeTokenError, RuntimeTokenIssue, RuntimeTokenScope, RuntimeTokenService,
     TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
