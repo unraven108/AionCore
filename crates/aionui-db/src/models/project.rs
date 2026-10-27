@@ -98,6 +98,9 @@ pub struct FolderRow {
 pub struct ProjectExplorerRow {
     pub pe_id: String,
     pub project_id: String,
+    /// Denormalized owner. Must always equal the parent project's `user_id`;
+    /// startup repair re-aligns historical drift.
+    pub owner_user_id: String,
     pub folder_id: String,
     /// One of: "workspace", "attached" (see [`Role`]).
     pub role: String,

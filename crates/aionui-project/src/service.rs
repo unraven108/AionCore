@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use aionui_common::generate_short_id;
-use aionui_db::{FolderRow, IProjectStore, ProjectExplorerRow, ProjectKind, Role};
+use aionui_db::{DbError, FolderRow, IProjectStore, ProjectExplorerRow, ProjectKind, Role};
 use chrono::{Datelike, Local};
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -120,9 +120,17 @@ impl ProjectService {
         if kind == ProjectKind::Standard
             && let Some(entry) = self
                 .store
-                .select_workspace_entry_by_folder(user_id, &folder.folder_id)
+                .find_workspace_entry_by_project_owner(user_id, &folder.folder_id)
                 .await?
         {
+            // The lookup resolves ownership through the project; re-align a
+            // drifted entry before returning it so the caller's next
+            // get_project/list_entries can see it.
+            let entry = if entry.owner_user_id == user_id {
+                entry
+            } else {
+                self.store.reown_entry(&entry.pe_id, user_id).await?
+            };
             let project = self
                 .store
                 .get_project(user_id, &entry.project_id)
@@ -169,21 +177,46 @@ impl ProjectService {
         self.ensure_accessible(&canonical)?;
         let folder = self.store.upsert_folder(canonical.as_str(), &input.uri).await?;
 
-        let entries = self.store.list_entries(user_id, &input.project_id).await?;
-        if entries.iter().any(|(entry, _)| entry.folder_id == folder.folder_id) {
-            return Err(ProjectError::ProjectExplorerDuplicate {
-                project_id: input.project_id,
-                folder_id: folder.folder_id,
-            });
+        // The duplicate check is owner-agnostic on purpose: `(project_id,
+        // folder_id)` is globally unique, so a stale entry owned by a
+        // different user would pass a user-scoped check and turn the INSERT
+        // into a 500. The project ownership gate above makes it safe to
+        // re-align such an entry to the caller.
+        if let Some(existing) = self
+            .store
+            .find_entry_by_project_folder(&input.project_id, &folder.folder_id)
+            .await?
+        {
+            if existing.owner_user_id == user_id {
+                return Err(ProjectError::ProjectExplorerDuplicate {
+                    project_id: input.project_id,
+                    folder_id: folder.folder_id,
+                });
+            }
+            let row = self
+                .store
+                .reown_entry(&existing.pe_id, user_id)
+                .await
+                .map_err(|error| duplicate_or(error, &input.project_id, &folder.folder_id))?;
+            return Ok(row);
         }
 
+        let entries = self.store.list_entries_for_project(&input.project_id).await?;
         let new_path = canonical::fs_path(&canonical)?;
         for (entry, folder_row) in &entries {
             let existing = canonical::canonicalize(&folder_row.resource_canonical)?;
             let existing_path = canonical::fs_path(&existing)?;
             if new_path.starts_with(&existing_path) {
                 // New folder is a descendant of an existing entry → focus it.
-                return Ok(entry.clone());
+                if entry.owner_user_id == user_id {
+                    return Ok(entry.clone());
+                }
+                let row = self
+                    .store
+                    .reown_entry(&entry.pe_id, user_id)
+                    .await
+                    .map_err(|error| duplicate_or(error, &input.project_id, &folder.folder_id))?;
+                return Ok(row);
             }
             if existing_path.starts_with(&new_path) {
                 // New folder is an ancestor of an existing entry → overlap.
@@ -203,7 +236,8 @@ impl ProjectService {
                 input.display_name.as_deref(),
                 order_index,
             )
-            .await?;
+            .await
+            .map_err(|error| duplicate_or(error, &input.project_id, &folder.folder_id))?;
         // A newly attached folder can bring a repository into view. The
         // focus-in-place branches above return early without notifying — they add
         // no root, so the repository set is unchanged.
@@ -500,5 +534,19 @@ fn runtime_status_of(folder: &FolderRow) -> (RuntimeStatus, Option<String>) {
             std::io::ErrorKind::PermissionDenied => (RuntimeStatus::PermissionDenied, None),
             _ => (RuntimeStatus::Missing, Some(err.to_string())),
         },
+    }
+}
+
+/// Translate a UNIQUE violation on `project_explorer` into the domain
+/// duplicate error; anything else passes through unchanged. The route layer
+/// maps the duplicate to 409, so it never surfaces as a generic 500.
+fn duplicate_or(error: DbError, project_id: &str, folder_id: &str) -> ProjectError {
+    if error.is_unique_violation() {
+        ProjectError::ProjectExplorerDuplicate {
+            project_id: project_id.to_owned(),
+            folder_id: folder_id.to_owned(),
+        }
+    } else {
+        error.into()
     }
 }

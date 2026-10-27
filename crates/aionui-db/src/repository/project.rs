@@ -34,6 +34,27 @@ pub trait IProjectStore: Send + Sync {
         folder_id: &str,
     ) -> Result<Option<ProjectExplorerRow>, DbError>;
 
+    /// Like [`Self::select_workspace_entry_by_folder`], but resolves ownership
+    /// through the parent project rather than the denormalized entry owner.
+    /// Used by project resolution so a drifted entry still reuses its project.
+    async fn find_workspace_entry_by_project_owner(
+        &self,
+        user_id: &str,
+        folder_id: &str,
+    ) -> Result<Option<ProjectExplorerRow>, DbError>;
+
+    /// The entry for `(project_id, folder_id)` regardless of its owner.
+    /// Callers must have verified that the project belongs to the acting user.
+    async fn find_entry_by_project_folder(
+        &self,
+        project_id: &str,
+        folder_id: &str,
+    ) -> Result<Option<ProjectExplorerRow>, DbError>;
+
+    /// Re-own an entry. Precondition: the caller verified that the parent
+    /// project belongs to `owner_user_id`.
+    async fn reown_entry(&self, pe_id: &str, owner_user_id: &str) -> Result<ProjectExplorerRow, DbError>;
+
     async fn get_entry(&self, user_id: &str, pe_id: &str) -> Result<Option<ProjectExplorerRow>, DbError>;
 
     /// All explorer entries of a project owned by `user_id`, each joined with
@@ -41,6 +62,13 @@ pub trait IProjectStore: Send + Sync {
     async fn list_entries(
         &self,
         user_id: &str,
+        project_id: &str,
+    ) -> Result<Vec<(ProjectExplorerRow, FolderRow)>, DbError>;
+
+    /// All explorer entries of a project regardless of entry owner. Callers
+    /// must have verified project ownership.
+    async fn list_entries_for_project(
+        &self,
         project_id: &str,
     ) -> Result<Vec<(ProjectExplorerRow, FolderRow)>, DbError>;
 

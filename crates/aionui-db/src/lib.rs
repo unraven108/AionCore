@@ -8,6 +8,7 @@ mod instance_lock;
 mod legacy_handoff;
 mod migrate_repair;
 pub mod models;
+mod project_scope_repair;
 mod repository;
 
 pub use agent_binding::{

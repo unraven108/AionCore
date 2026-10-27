@@ -274,6 +274,13 @@ impl IUserRepository for SqliteUserRepository {
         .await?;
 
         tx.commit().await?;
+
+        // Adoption moves tables with `UPDATE OR IGNORE`; a collision on one
+        // table can leave project and project_explorer owners out of sync.
+        // Re-align the chain immediately so the first login already sees a
+        // consistent explorer. Best-effort: the repair logs and never fails.
+        crate::project_scope_repair::repair_if_drifted(&self.pool).await;
+
         Ok(moved)
     }
 

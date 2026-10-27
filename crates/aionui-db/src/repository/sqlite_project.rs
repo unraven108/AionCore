@@ -19,7 +19,8 @@ impl SqliteProjectStore {
 
 const FOLDER_COLS: &str = "folder_id, resource_uri, resource_canonical, created_at, updated_at";
 const PROJECT_COLS: &str = "project_id, name, kind, created_at, updated_at";
-const ENTRY_COLS: &str = "pe_id, project_id, folder_id, role, display_name, order_index, created_at, updated_at";
+const ENTRY_COLS: &str = "pe_id, project_id, owner_user_id, folder_id, role, display_name, order_index, created_at, updated_at";
+const ENTRY_COLS_QUALIFIED: &str = "pe.pe_id, pe.project_id, pe.owner_user_id, pe.folder_id, pe.role, pe.display_name, pe.order_index, pe.created_at, pe.updated_at";
 
 #[async_trait::async_trait]
 impl IProjectStore for SqliteProjectStore {
@@ -95,6 +96,61 @@ impl IProjectStore for SqliteProjectStore {
         Ok(row)
     }
 
+    async fn find_workspace_entry_by_project_owner(
+        &self,
+        user_id: &str,
+        folder_id: &str,
+    ) -> Result<Option<ProjectExplorerRow>, DbError> {
+        // Deliberately filters on the parent project's owner, not the entry's
+        // denormalized `owner_user_id`: a drifted entry must still be found so
+        // resolve_core reuses its project instead of creating a duplicate.
+        let row = sqlx::query_as::<_, ProjectExplorerRow>(&format!(
+            "SELECT {ENTRY_COLS_QUALIFIED} FROM project_explorer pe \
+             JOIN projects p ON p.project_id = pe.project_id \
+             WHERE pe.folder_id = ? AND pe.role = 'workspace' AND p.user_id = ? \
+             ORDER BY (pe.owner_user_id = p.user_id) DESC, pe.created_at ASC, pe.pe_id ASC \
+             LIMIT 1"
+        ))
+        .bind(folder_id)
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    async fn find_entry_by_project_folder(
+        &self,
+        project_id: &str,
+        folder_id: &str,
+    ) -> Result<Option<ProjectExplorerRow>, DbError> {
+        // Owner-agnostic on purpose: the caller has already verified that the
+        // project belongs to the acting user, so a row under a different owner
+        // is precisely the drift this lookup exists to catch.
+        let row = sqlx::query_as::<_, ProjectExplorerRow>(&format!(
+            "SELECT {ENTRY_COLS} FROM project_explorer WHERE project_id = ? AND folder_id = ? LIMIT 1"
+        ))
+        .bind(project_id)
+        .bind(folder_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    async fn reown_entry(&self, pe_id: &str, owner_user_id: &str) -> Result<ProjectExplorerRow, DbError> {
+        let result = sqlx::query("UPDATE project_explorer SET owner_user_id = ? WHERE pe_id = ?")
+            .bind(owner_user_id)
+            .bind(pe_id)
+            .execute(&self.pool)
+            .await
+            .map_err(map_entry_unique_violation)?;
+        if result.rows_affected() == 0 {
+            return Err(DbError::NotFound(format!("project_explorer {pe_id}")));
+        }
+        self.get_entry(owner_user_id, pe_id)
+            .await?
+            .ok_or_else(|| DbError::NotFound(format!("project_explorer {pe_id} after re-own")))
+    }
+
     async fn list_entries(
         &self,
         user_id: &str,
@@ -104,8 +160,8 @@ impl IProjectStore for SqliteProjectStore {
         // names (folder_id / created_at / updated_at), so folder columns are
         // aliased and rows are mapped by name rather than via a tuple FromRow.
         let rows = sqlx::query(
-            "SELECT pe.pe_id, pe.project_id, pe.folder_id, pe.role, pe.display_name, pe.order_index, \
-                    pe.created_at, pe.updated_at, \
+            "SELECT pe.pe_id, pe.project_id, pe.owner_user_id, pe.folder_id, pe.role, pe.display_name, \
+                    pe.order_index, pe.created_at, pe.updated_at, \
                     f.resource_uri AS f_resource_uri, f.resource_canonical AS f_resource_canonical, \
                     f.created_at AS f_created_at, f.updated_at AS f_updated_at \
              FROM project_explorer pe \
@@ -118,29 +174,28 @@ impl IProjectStore for SqliteProjectStore {
         .fetch_all(&self.pool)
         .await?;
 
-        let mut out = Vec::with_capacity(rows.len());
-        for r in rows {
-            let folder_id: String = r.get("folder_id");
-            let entry = ProjectExplorerRow {
-                pe_id: r.get("pe_id"),
-                project_id: r.get("project_id"),
-                folder_id: folder_id.clone(),
-                role: r.get("role"),
-                display_name: r.get("display_name"),
-                order_index: r.get("order_index"),
-                created_at: r.get("created_at"),
-                updated_at: r.get("updated_at"),
-            };
-            let folder = FolderRow {
-                folder_id,
-                resource_uri: r.get("f_resource_uri"),
-                resource_canonical: r.get("f_resource_canonical"),
-                created_at: r.get("f_created_at"),
-                updated_at: r.get("f_updated_at"),
-            };
-            out.push((entry, folder));
-        }
-        Ok(out)
+        Ok(map_entry_rows(rows))
+    }
+
+    async fn list_entries_for_project(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<(ProjectExplorerRow, FolderRow)>, DbError> {
+        let rows = sqlx::query(
+            "SELECT pe.pe_id, pe.project_id, pe.owner_user_id, pe.folder_id, pe.role, pe.display_name, \
+                    pe.order_index, pe.created_at, pe.updated_at, \
+                    f.resource_uri AS f_resource_uri, f.resource_canonical AS f_resource_canonical, \
+                    f.created_at AS f_created_at, f.updated_at AS f_updated_at \
+             FROM project_explorer pe \
+             JOIN folders f ON f.folder_id = pe.folder_id \
+             WHERE pe.project_id = ? \
+             ORDER BY pe.order_index ASC, pe.created_at ASC",
+        )
+        .bind(project_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(map_entry_rows(rows))
     }
 
     async fn create_project_with_workspace_entry(
@@ -239,7 +294,8 @@ impl IProjectStore for SqliteProjectStore {
         .bind(now)
         .bind(now)
         .execute(&self.pool)
-        .await?;
+        .await
+        .map_err(map_entry_unique_violation)?;
         self.get_entry(user_id, &pe_id)
             .await?
             .ok_or_else(|| DbError::NotFound(format!("project_explorer {pe_id} after insert")))
@@ -314,5 +370,43 @@ impl IProjectStore for SqliteProjectStore {
         self.get_entry(user_id, pe_id)
             .await?
             .ok_or_else(|| DbError::NotFound(format!("project_explorer {pe_id}")))
+    }
+}
+
+fn map_entry_rows(rows: Vec<sqlx::sqlite::SqliteRow>) -> Vec<(ProjectExplorerRow, FolderRow)> {
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let folder_id: String = row.get("folder_id");
+        let entry = ProjectExplorerRow {
+            pe_id: row.get("pe_id"),
+            project_id: row.get("project_id"),
+            owner_user_id: row.get("owner_user_id"),
+            folder_id: folder_id.clone(),
+            role: row.get("role"),
+            display_name: row.get("display_name"),
+            order_index: row.get("order_index"),
+            created_at: row.get("created_at"),
+            updated_at: row.get("updated_at"),
+        };
+        let folder = FolderRow {
+            folder_id,
+            resource_uri: row.get("f_resource_uri"),
+            resource_canonical: row.get("f_resource_canonical"),
+            created_at: row.get("f_created_at"),
+            updated_at: row.get("f_updated_at"),
+        };
+        out.push((entry, folder));
+    }
+    out
+}
+
+/// Map a UNIQUE violation on `project_explorer` to a domain conflict so the
+/// service can answer 409 instead of leaking a 500.
+fn map_entry_unique_violation(error: sqlx::Error) -> DbError {
+    let db_error = DbError::from(error);
+    if db_error.is_unique_violation() {
+        DbError::Conflict("project_explorer entry already exists".to_owned())
+    } else {
+        db_error
     }
 }

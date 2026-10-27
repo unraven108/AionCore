@@ -189,6 +189,7 @@ pub async fn init_database_memory() -> Result<Database, DbError> {
     // needed (and there is no on-disk path we could create one against).
     run_migrations(&pool).await?;
     ensure_system_user(&pool).await?;
+    crate::project_scope_repair::repair_if_drifted(&pool).await;
 
     info!("In-memory database initialized");
     Ok(Database { pool })
@@ -305,6 +306,11 @@ async fn try_init_file_staged(path: &Path) -> Result<Database, DatabaseInitError
     ensure_system_user(&pool)
         .await
         .map_err(|e| DatabaseInitError::new("database.seed", e))?;
+
+    // Re-align the project explorer owner chain (see project_scope_repair).
+    // Runs after the system user exists and while the startup lock is held;
+    // failure is non-fatal so a damaged explorer cannot block startup.
+    crate::project_scope_repair::repair_if_drifted(&pool).await;
 
     info!("Database initialized at {}", path.display());
     Ok(Database { pool })

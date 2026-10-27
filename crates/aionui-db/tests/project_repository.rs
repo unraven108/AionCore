@@ -1,11 +1,32 @@
 use std::sync::Arc;
 
-use aionui_db::{Database, IProjectStore, ProjectKind, SqliteProjectStore, init_database_memory};
+use aionui_db::{Database, DbError, IProjectStore, ProjectKind, SqliteProjectStore, init_database_memory};
 
 async fn store() -> (Arc<dyn IProjectStore>, Database) {
     let db = init_database_memory().await.unwrap();
     let s = Arc::new(SqliteProjectStore::new(db.pool().clone()));
     (s as Arc<dyn IProjectStore>, db)
+}
+
+async fn add_user(pool: &aionui_db::SqlitePool, id: &str) {
+    sqlx::query(
+        "INSERT INTO users (id, user_type, username, password_hash, status, session_generation, created_at, updated_at) \
+         VALUES (?, 'local', ?, '', 'active', 0, 1, 1)",
+    )
+    .bind(id)
+    .bind(id)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+async fn drift_entry(pool: &aionui_db::SqlitePool, pe_id: &str, owner: &str) {
+    sqlx::query("UPDATE project_explorer SET owner_user_id = ? WHERE pe_id = ?")
+        .bind(owner)
+        .bind(pe_id)
+        .execute(pool)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -266,4 +287,90 @@ async fn get_missing_project_and_entry_return_none() {
             .unwrap()
             .is_none()
     );
+}
+
+#[tokio::test]
+async fn owner_scoped_lookups_ignore_a_drifted_entry_owner() {
+    let (store, db) = store().await;
+    let pool = db.pool().clone();
+    add_user(&pool, "user_drift").await;
+    let folder = store.upsert_folder("file:///ws", "file:///ws").await.unwrap();
+    let (project, entry) = store
+        .create_project_with_workspace_entry("system_default_user", &folder.folder_id, "ws", ProjectKind::Standard)
+        .await
+        .unwrap();
+    drift_entry(&pool, &entry.pe_id, "user_drift").await;
+
+    // User-scoped reads cannot see the drifted binding.
+    assert!(
+        store
+            .select_workspace_entry_by_folder("system_default_user", &folder.folder_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .list_entries("system_default_user", &project.project_id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // Project-owner lookup still finds it, which is what resolve_core needs.
+    let found = store
+        .find_workspace_entry_by_project_owner("system_default_user", &folder.folder_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(found.pe_id, entry.pe_id);
+
+    // Owner-agnostic exact lookup exposes the drifted owner.
+    let exact = store
+        .find_entry_by_project_folder(&project.project_id, &folder.folder_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(exact.owner_user_id, "user_drift");
+
+    // Project-level listing is owner-agnostic.
+    assert_eq!(
+        store.list_entries_for_project(&project.project_id).await.unwrap().len(),
+        1
+    );
+
+    let reowned = store
+        .reown_entry(&entry.pe_id, "system_default_user")
+        .await
+        .unwrap();
+    assert_eq!(reowned.owner_user_id, "system_default_user");
+    assert_eq!(
+        store
+            .list_entries("system_default_user", &project.project_id)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn insert_attached_entry_duplicate_is_a_conflict() {
+    let (store, _db) = store().await;
+    let folder = store.upsert_folder("file:///ws", "file:///ws").await.unwrap();
+    let attached = store.upsert_folder("file:///att", "file:///att").await.unwrap();
+    let (project, _) = store
+        .create_project_with_workspace_entry("system_default_user", &folder.folder_id, "ws", ProjectKind::Standard)
+        .await
+        .unwrap();
+
+    store
+        .insert_attached_entry("system_default_user", &project.project_id, &attached.folder_id, None, 1)
+        .await
+        .unwrap();
+    let error = store
+        .insert_attached_entry("system_default_user", &project.project_id, &attached.folder_id, None, 2)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, DbError::Conflict(_)), "expected Conflict, got {error:?}");
 }

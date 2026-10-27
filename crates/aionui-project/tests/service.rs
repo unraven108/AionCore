@@ -709,3 +709,100 @@ async fn a_case_variant_folder_resolves_to_one_repo_identity() {
         );
     }
 }
+
+async fn create_drift_user(pool: aionui_db::SqlitePool) -> String {
+    let users: Arc<dyn aionui_db::IUserRepository> =
+        Arc::new(aionui_db::SqliteUserRepository::new(pool));
+    users.create_user("drift", "").await.unwrap().id
+}
+
+#[tokio::test]
+async fn attach_folder_reowns_a_drifted_duplicate_instead_of_failing() {
+    let ws = tempfile::tempdir().unwrap();
+    let att = tempfile::tempdir().unwrap();
+    let (svc, store, db) = harness(std::env::temp_dir()).await;
+
+    let out = svc
+        .create_standard("system_default_user", uri_of(ws.path()))
+        .await
+        .unwrap();
+    let attached = svc
+        .attach_folder(
+            "system_default_user",
+            AttachInput {
+                project_id: out.project.project_id.clone(),
+                uri: uri_of(att.path()),
+                display_name: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let drift_user = create_drift_user(db.pool().clone()).await;
+    store.reown_entry(&attached.pe_id, &drift_user).await.unwrap();
+
+    // The entry is invisible to the user-scoped panel, but the global
+    // `(project_id, folder_id)` unique index would reject a fresh insert —
+    // this used to surface as a 500.
+    let reattached = svc
+        .attach_folder(
+            "system_default_user",
+            AttachInput {
+                project_id: out.project.project_id.clone(),
+                uri: uri_of(att.path()),
+                display_name: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(reattached.pe_id, attached.pe_id);
+    assert!(
+        store
+            .get_entry("system_default_user", &attached.pe_id)
+            .await
+            .unwrap()
+            .is_some(),
+        "the drifted entry must be re-owned to the caller"
+    );
+    assert_eq!(
+        store
+            .list_entries("system_default_user", &out.project.project_id)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn create_standard_reuses_project_when_workspace_owner_drifted() {
+    let ws = tempfile::tempdir().unwrap();
+    let (svc, store, db) = harness(std::env::temp_dir()).await;
+
+    let first = svc
+        .create_standard("system_default_user", uri_of(ws.path()))
+        .await
+        .unwrap();
+    let drift_user = create_drift_user(db.pool().clone()).await;
+    store
+        .reown_entry(&first.project_explorer.pe_id, &drift_user)
+        .await
+        .unwrap();
+
+    let second = svc
+        .create_standard("system_default_user", uri_of(ws.path()))
+        .await
+        .unwrap();
+
+    assert_eq!(second.project.project_id, first.project.project_id);
+    assert_eq!(second.project_explorer.pe_id, first.project_explorer.pe_id);
+    assert!(
+        store
+            .get_entry("system_default_user", &first.project_explorer.pe_id)
+            .await
+            .unwrap()
+            .is_some(),
+        "the workspace entry must be re-owned instead of duplicated"
+    );
+}
