@@ -711,8 +711,7 @@ async fn a_case_variant_folder_resolves_to_one_repo_identity() {
 }
 
 async fn create_drift_user(pool: aionui_db::SqlitePool) -> String {
-    let users: Arc<dyn aionui_db::IUserRepository> =
-        Arc::new(aionui_db::SqliteUserRepository::new(pool));
+    let users: Arc<dyn aionui_db::IUserRepository> = Arc::new(aionui_db::SqliteUserRepository::new(pool));
     users.create_user("drift", "").await.unwrap().id
 }
 

@@ -166,17 +166,14 @@ pub(crate) async fn repair_if_drifted(pool: &SqlitePool) {
 async fn detect(pool: &SqlitePool) -> Result<ProjectScopeDrift, DbError> {
     let mut connection = pool.acquire().await?;
     Ok(ProjectScopeDrift {
-        orphan_entries: count(&mut *connection, ORPHAN_ENTRIES_SQL).await?,
-        owner_mismatch: count(&mut *connection, OWNER_MISMATCH_SQL).await?,
-        duplicate_workspace_groups: count(&mut *connection, DUPLICATE_WORKSPACE_GROUPS_SQL).await?,
-        projects_without_workspace: count(&mut *connection, PROJECTS_WITHOUT_WORKSPACE_SQL).await?,
+        orphan_entries: count(&mut connection, ORPHAN_ENTRIES_SQL).await?,
+        owner_mismatch: count(&mut connection, OWNER_MISMATCH_SQL).await?,
+        duplicate_workspace_groups: count(&mut connection, DUPLICATE_WORKSPACE_GROUPS_SQL).await?,
+        projects_without_workspace: count(&mut connection, PROJECTS_WITHOUT_WORKSPACE_SQL).await?,
     })
 }
 
-async fn count(
-    connection: &mut sqlx::SqliteConnection,
-    sql: &str,
-) -> Result<i64, DbError> {
+async fn count(connection: &mut sqlx::SqliteConnection, sql: &str) -> Result<i64, DbError> {
     let value = sqlx::query_scalar::<_, i64>(sql).fetch_one(&mut *connection).await?;
     Ok(value)
 }
@@ -201,7 +198,7 @@ async fn repair(pool: &SqlitePool) -> Result<ProjectScopeRepairReport, DbError> 
             ..Default::default()
         };
 
-        merge_duplicate_projects(&mut *connection, &mut report).await?;
+        merge_duplicate_projects(&mut connection, &mut report).await?;
 
         report.entries_reowned = sqlx::query(
             "UPDATE project_explorer \
@@ -216,8 +213,8 @@ async fn repair(pool: &SqlitePool) -> Result<ProjectScopeRepairReport, DbError> 
         .await?
         .rows_affected();
 
-        report.residual_owner_mismatch = count(&mut *connection, OWNER_MISMATCH_SQL).await?;
-        report.projects_without_workspace = count(&mut *connection, PROJECTS_WITHOUT_WORKSPACE_SQL).await?;
+        report.residual_owner_mismatch = count(&mut connection, OWNER_MISMATCH_SQL).await?;
+        report.projects_without_workspace = count(&mut connection, PROJECTS_WITHOUT_WORKSPACE_SQL).await?;
 
         Ok(report)
     }
@@ -296,9 +293,7 @@ async fn merge_duplicate_projects(
                 .cmp(&left.activity_at)
                 .then_with(|| right.project_updated_at.cmp(&left.project_updated_at))
                 .then_with(|| right.project_created_at.cmp(&left.project_created_at))
-                .then_with(|| {
-                    (right.healthy_entries > 0).cmp(&(left.healthy_entries > 0))
-                })
+                .then_with(|| (right.healthy_entries > 0).cmp(&(left.healthy_entries > 0)))
                 .then_with(|| right.project_id.cmp(&left.project_id))
         });
 
@@ -322,45 +317,41 @@ async fn merge_duplicate_projects(
             .await?
             .rows_affected();
 
-            report.attached_entries_moved += sqlx::query(
-                "UPDATE project_explorer SET project_id = ? WHERE project_id = ? AND role <> 'workspace'",
-            )
-            .bind(&survivor.project_id)
-            .bind(&loser.project_id)
-            .execute(&mut *connection)
-            .await?
-            .rows_affected();
+            report.attached_entries_moved +=
+                sqlx::query("UPDATE project_explorer SET project_id = ? WHERE project_id = ? AND role <> 'workspace'")
+                    .bind(&survivor.project_id)
+                    .bind(&loser.project_id)
+                    .execute(&mut *connection)
+                    .await?
+                    .rows_affected();
 
             // Only move children that already belong to the loser's owner;
             // a foreign-owned child is a separate invariant violation and
             // moving it would transfer another user's data.
-            report.conversations_repointed += sqlx::query(
-                "UPDATE conversations SET project_id = ? WHERE project_id = ? AND user_id = ?",
-            )
-            .bind(&survivor.project_id)
-            .bind(&loser.project_id)
-            .bind(&loser.owner_user_id)
-            .execute(&mut *connection)
-            .await?
-            .rows_affected();
+            report.conversations_repointed +=
+                sqlx::query("UPDATE conversations SET project_id = ? WHERE project_id = ? AND user_id = ?")
+                    .bind(&survivor.project_id)
+                    .bind(&loser.project_id)
+                    .bind(&loser.owner_user_id)
+                    .execute(&mut *connection)
+                    .await?
+                    .rows_affected();
 
-            report.teams_repointed += sqlx::query(
-                "UPDATE teams SET project_id = ? WHERE project_id = ? AND user_id = ?",
-            )
-            .bind(&survivor.project_id)
-            .bind(&loser.project_id)
-            .bind(&loser.owner_user_id)
-            .execute(&mut *connection)
-            .await?
-            .rows_affected();
+            report.teams_repointed +=
+                sqlx::query("UPDATE teams SET project_id = ? WHERE project_id = ? AND user_id = ?")
+                    .bind(&survivor.project_id)
+                    .bind(&loser.project_id)
+                    .bind(&loser.owner_user_id)
+                    .execute(&mut *connection)
+                    .await?
+                    .rows_affected();
 
-            let foreign_conversations: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM conversations WHERE project_id = ? AND user_id <> ?",
-            )
-            .bind(&loser.project_id)
-            .bind(&loser.owner_user_id)
-            .fetch_one(&mut *connection)
-            .await?;
+            let foreign_conversations: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM conversations WHERE project_id = ? AND user_id <> ?")
+                    .bind(&loser.project_id)
+                    .bind(&loser.owner_user_id)
+                    .fetch_one(&mut *connection)
+                    .await?;
             let foreign_teams: i64 =
                 sqlx::query_scalar("SELECT COUNT(*) FROM teams WHERE project_id = ? AND user_id <> ?")
                     .bind(&loser.project_id)
@@ -456,7 +447,13 @@ mod tests {
     async fn duplicate_pair(
         pool: &SqlitePool,
         store: &Arc<dyn IProjectStore>,
-    ) -> (ProjectRow, ProjectExplorerRow, ProjectRow, ProjectExplorerRow, FolderRow) {
+    ) -> (
+        ProjectRow,
+        ProjectExplorerRow,
+        ProjectRow,
+        ProjectExplorerRow,
+        FolderRow,
+    ) {
         add_user(pool, "user_drift").await;
         let folder = store.upsert_folder("file:///ws", "file:///ws").await.unwrap();
         let (old_project, old_entry) = store
@@ -498,11 +495,13 @@ mod tests {
         assert_eq!(report.entries_reowned, 1);
         assert_eq!(owner_of(&pool, &entry.pe_id).await, "system_default_user");
         assert_eq!(detect(&pool).await.unwrap().owner_mismatch, 0);
-        assert!(store
-            .get_project("system_default_user", &project.project_id)
-            .await
-            .unwrap()
-            .is_some());
+        assert!(
+            store
+                .get_project("system_default_user", &project.project_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[tokio::test]
@@ -518,11 +517,13 @@ mod tests {
         assert_eq!(report.conversations_repointed, 1);
 
         assert_eq!(scalar(&pool, "SELECT COUNT(*) FROM projects").await, 1);
-        assert!(store
-            .get_project("system_default_user", &old_project.project_id)
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            store
+                .get_project("system_default_user", &old_project.project_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
         let old_conversation_project: String =
             sqlx::query_scalar("SELECT project_id FROM conversations WHERE id = 'c_old'")
                 .fetch_one(&pool)
@@ -563,11 +564,10 @@ mod tests {
 
         let report = repair(&pool).await.unwrap();
         assert_eq!(report.foreign_children_left, 1);
-        let foreign_project: String =
-            sqlx::query_scalar("SELECT project_id FROM conversations WHERE id = 'c_foreign'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let foreign_project: String = sqlx::query_scalar("SELECT project_id FROM conversations WHERE id = 'c_foreign'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert_eq!(foreign_project, old_project.project_id);
     }
 
@@ -576,13 +576,28 @@ mod tests {
         let (pool, store, _db) = setup().await;
         let (old_project, _old_entry, new_project, _new_entry, _folder) = duplicate_pair(&pool, &store).await;
         let shared = store.upsert_folder("file:///shared", "file:///shared").await.unwrap();
-        let old_only = store.upsert_folder("file:///old-only", "file:///old-only").await.unwrap();
-        store
-            .insert_attached_entry("system_default_user", &old_project.project_id, &shared.folder_id, Some("Shared"), 1)
+        let old_only = store
+            .upsert_folder("file:///old-only", "file:///old-only")
             .await
             .unwrap();
         store
-            .insert_attached_entry("system_default_user", &new_project.project_id, &shared.folder_id, Some("Shared"), 1)
+            .insert_attached_entry(
+                "system_default_user",
+                &old_project.project_id,
+                &shared.folder_id,
+                Some("Shared"),
+                1,
+            )
+            .await
+            .unwrap();
+        store
+            .insert_attached_entry(
+                "system_default_user",
+                &new_project.project_id,
+                &shared.folder_id,
+                Some("Shared"),
+                1,
+            )
             .await
             .unwrap();
         store
@@ -606,7 +621,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(entries.len(), 3);
-        assert!(entries.iter().any(|(entry, _)| entry.display_name.as_deref() == Some("OldOnly")));
+        assert!(
+            entries
+                .iter()
+                .any(|(entry, _)| entry.display_name.as_deref() == Some("OldOnly"))
+        );
     }
 
     #[tokio::test]

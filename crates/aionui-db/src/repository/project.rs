@@ -67,10 +67,8 @@ pub trait IProjectStore: Send + Sync {
 
     /// All explorer entries of a project regardless of entry owner. Callers
     /// must have verified project ownership.
-    async fn list_entries_for_project(
-        &self,
-        project_id: &str,
-    ) -> Result<Vec<(ProjectExplorerRow, FolderRow)>, DbError>;
+    async fn list_entries_for_project(&self, project_id: &str)
+    -> Result<Vec<(ProjectExplorerRow, FolderRow)>, DbError>;
 
     /// Atomic unit: create a project and its single `workspace` entry in one
     /// transaction, both owned by `user_id`. On a

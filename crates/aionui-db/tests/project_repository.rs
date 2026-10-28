@@ -339,10 +339,7 @@ async fn owner_scoped_lookups_ignore_a_drifted_entry_owner() {
         1
     );
 
-    let reowned = store
-        .reown_entry(&entry.pe_id, "system_default_user")
-        .await
-        .unwrap();
+    let reowned = store.reown_entry(&entry.pe_id, "system_default_user").await.unwrap();
     assert_eq!(reowned.owner_user_id, "system_default_user");
     assert_eq!(
         store
@@ -372,5 +369,8 @@ async fn insert_attached_entry_duplicate_is_a_conflict() {
         .insert_attached_entry("system_default_user", &project.project_id, &attached.folder_id, None, 2)
         .await
         .unwrap_err();
-    assert!(matches!(error, DbError::Conflict(_)), "expected Conflict, got {error:?}");
+    assert!(
+        matches!(error, DbError::Conflict(_)),
+        "expected Conflict, got {error:?}"
+    );
 }

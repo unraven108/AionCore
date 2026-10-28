@@ -19,7 +19,8 @@ impl SqliteProjectStore {
 
 const FOLDER_COLS: &str = "folder_id, resource_uri, resource_canonical, created_at, updated_at";
 const PROJECT_COLS: &str = "project_id, name, kind, created_at, updated_at";
-const ENTRY_COLS: &str = "pe_id, project_id, owner_user_id, folder_id, role, display_name, order_index, created_at, updated_at";
+const ENTRY_COLS: &str =
+    "pe_id, project_id, owner_user_id, folder_id, role, display_name, order_index, created_at, updated_at";
 const ENTRY_COLS_QUALIFIED: &str = "pe.pe_id, pe.project_id, pe.owner_user_id, pe.folder_id, pe.role, pe.display_name, pe.order_index, pe.created_at, pe.updated_at";
 
 #[async_trait::async_trait]
