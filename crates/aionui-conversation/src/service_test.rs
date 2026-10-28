@@ -4650,23 +4650,23 @@ async fn ensure_runtime_uses_existing_agent_snapshot_without_recovery() {
 }
 
 #[tokio::test]
-async fn restart_runtime_without_existing_task_is_rejected() {
+async fn restart_runtime_without_existing_task_builds_one() {
     let task_mgr = Arc::new(MockTaskManager::new());
     let (svc, _broadcaster, _repo) = make_service_with_mock_task_manager(task_mgr.clone());
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
 
-    let error = svc
+    // A conversation can be cold (never warmed up) or still warming up when the
+    // user switches accounts. The restart must build a runtime in that case
+    // instead of rejecting it — otherwise the warm-up that is already running
+    // finishes with the previous account and serves the next turn.
+    let result = svc
         .restart_runtime("user_1", &conv.id, &(task_mgr.clone() as Arc<dyn IWorkerTaskManager>))
         .await
-        .unwrap_err();
+        .unwrap();
 
-    assert!(matches!(
-        error,
-        ConversationError::Busy { reason }
-            if reason == format!("conversation {} runtime is not ready to restart", conv.id)
-    ));
-    assert_eq!(task_mgr.kill_count(), 0);
-    assert!(task_mgr.get_task(&conv.id).is_none());
+    assert!(result.recovered);
+    assert!(result.runtime.has_task);
+    assert!(task_mgr.get_task(&conv.id).is_some());
 }
 
 #[tokio::test]
@@ -4716,6 +4716,31 @@ async fn restart_runtime_cancels_active_turn_before_rebuild() {
         .try_claim_turn(&conv.id, "turn-before-restart")
         .unwrap();
 
+    let result = svc
+        .restart_runtime("user_1", &conv.id, &(task_mgr.clone() as Arc<dyn IWorkerTaskManager>))
+        .await
+        .unwrap();
+
+    assert_eq!(old_agent.cancel_count.load(Ordering::SeqCst), 1);
+    assert_eq!(task_mgr.kill_count(), 1);
+    assert!(result.runtime.has_task);
+    assert!(!svc.runtime_state().is_claimed(&conv.id));
+}
+
+#[tokio::test]
+async fn restart_runtime_kills_the_task_when_cancel_fails() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, _broadcaster, _repo) = make_service_with_mock_task_manager(task_mgr.clone());
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let old_agent = Arc::new(BlockingCancelAgent::new_with_cancel_error(&conv.id));
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(old_agent.clone()));
+    let _turn_claim = svc
+        .runtime_state()
+        .try_claim_turn(&conv.id, "turn-before-restart")
+        .unwrap();
+
+    // A cancel failure must not leave the old process alive: it would keep
+    // serving turns with the runtime configuration the restart is replacing.
     let result = svc
         .restart_runtime("user_1", &conv.id, &(task_mgr.clone() as Arc<dyn IWorkerTaskManager>))
         .await

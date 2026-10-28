@@ -4556,6 +4556,11 @@ impl ConversationService {
     /// Conversation messages, artifacts, and the persisted backend session anchor
     /// are intentionally left untouched so the rebuilt runtime can resume the
     /// existing backend session.
+    ///
+    /// A ready task is not required: a cold conversation is built from scratch,
+    /// and `kill_and_wait` waits out a warm-up that is still in flight before the
+    /// rebuild. That is what lets an account switch recycle a runtime spawned
+    /// with the previous account even when the switch lands during warm-up.
     #[tracing::instrument(skip_all, fields(user_id = %user_id, conversation_id = %conversation_id))]
     pub async fn restart_runtime(
         &self,
@@ -4581,20 +4586,12 @@ impl ConversationService {
             });
         }
 
-        // Checked BEFORE readiness: a restart in flight has already killed the
-        // task, so the readiness gate below would report a duplicate restart as
-        // "not ready to restart" — misleading, and a different code than the one
-        // the turn/config gates report for the very same state. `begin_restart`
-        // remains the authoritative guard for a genuine race.
+        // Keep duplicate restarts on their own error code: the first restart
+        // already owns the teardown, so callers should retry rather than receive
+        // a generic conflict from `begin_restart`.
         if self.runtime_state.is_restarting(conversation_id) {
             return Err(ConversationError::RuntimeRestarting {
                 conversation_id: conversation_id.to_owned(),
-            });
-        }
-
-        if task_manager.get_task(conversation_id).is_none() {
-            return Err(ConversationError::Busy {
-                reason: format!("conversation {conversation_id} runtime is not ready to restart"),
             });
         }
 
@@ -4606,14 +4603,28 @@ impl ConversationService {
                 // conversation working again, and the restart leaves it idle —
                 // so work queued FOR it must survive, not be discarded at the
                 // exact moment it became deliverable.
-                self.cancel_with_cause(
-                    user_id,
-                    conversation_id,
-                    &turn_id,
-                    task_manager,
-                    TurnCancelCause::RuntimeRestart,
-                )
-                .await?;
+                //
+                // A cancel failure must not abort the restart: the process is
+                // about to be killed anyway, and leaving it alive would keep
+                // serving turns under the configuration we are replacing (most
+                // importantly a previous CodeBuddy account).
+                if let Err(error) = self
+                    .cancel_with_cause(
+                        user_id,
+                        conversation_id,
+                        &turn_id,
+                        task_manager,
+                        TurnCancelCause::RuntimeRestart,
+                    )
+                    .await
+                {
+                    warn!(
+                        conversation_id,
+                        turn_id = %turn_id,
+                        error = %ErrorChain(&error),
+                        "Cancel before runtime restart failed; killing the runtime anyway"
+                    );
+                }
             }
 
             info!(conversation_id, "Restarting conversation runtime");
