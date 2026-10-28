@@ -404,14 +404,23 @@ impl AcpAgentManager {
             None
         };
 
-        Ok(prompt_outcome_from_stop_reason(
+        let mut outcome = prompt_outcome_from_stop_reason(
             sid,
             prompt_response.stop_reason,
             empty_turn,
             matched_command,
             auth_hint,
             observations.dialect_signal,
-        ))
+        );
+        // CodeBuddy reports *why* it refused on the prompt response, and that
+        // text already names this account's own reset time (quota windows are
+        // per account). Keep it instead of the generic refusal copy.
+        if let PromptOutcome::WarningTip { tips, .. } = &mut outcome
+            && let Some(message) = refusal_message_from_response(&prompt_response)
+        {
+            tips.params = Some(serde_json::json!({ "message": message }));
+        }
+        Ok(outcome)
     }
 
     /// Emit model/mode/config events from the session aggregate so the frontend
@@ -666,6 +675,24 @@ fn end_turn_usage_frame_from_response(response: &PromptResponse) -> Option<Value
     }))
 }
 
+/// The refusal cause CodeBuddy attaches to a `stop_reason: refusal` response.
+///
+/// `_meta["codebuddy.ai/errorMessage"]` holds a JSON-encoded error envelope
+/// such as `{"message":"429 您的使用量已超出频率限制，将在 … 重置", "data":{…}}`.
+/// The text is returned verbatim: a quota reset time is specific to the
+/// account that hit the limit, so the client must not replace it with generic
+/// copy.
+fn refusal_message_from_response(response: &PromptResponse) -> Option<String> {
+    let raw = response.meta.as_ref()?.get("codebuddy.ai/errorMessage")?.as_str()?;
+    let parsed = serde_json::from_str::<Value>(raw).unwrap_or_else(|_| Value::String(raw.to_owned()));
+    let message = parsed
+        .get("message")
+        .and_then(Value::as_str)
+        .or_else(|| parsed.as_str())?
+        .trim();
+    (!message.is_empty()).then(|| message.to_owned())
+}
+
 /// Carry previously-reported fields the end-of-turn write doesn't know —
 /// the context window size and the cumulative session cost — into a
 /// partial end-of-turn usage update (both the snapshot value and the wire
@@ -909,6 +936,23 @@ mod tests {
         });
         let zero = PromptResponse::new(StopReason::EndTurn).meta(empty_counts.as_object().cloned().unwrap());
         assert!(end_turn_usage_frame_from_response(&zero).is_none());
+    }
+
+    #[test]
+    fn refusal_message_is_read_from_the_codebuddy_error_meta() {
+        let meta = serde_json::json!({
+            "codebuddy.ai/errorMessage": "{\"message\":\"429 您的使用量已超出频率限制，将在 2026-10-28 11:18:30 UTC+8 重置\",\"data\":{\"statusCode\":429}}"
+        });
+        let response = PromptResponse::new(StopReason::Refusal).meta(meta.as_object().cloned().expect("meta object"));
+
+        assert_eq!(
+            super::refusal_message_from_response(&response).as_deref(),
+            Some("429 您的使用量已超出频率限制，将在 2026-10-28 11:18:30 UTC+8 重置")
+        );
+
+        // Responses without the dialect keep the generic copy.
+        let bare = PromptResponse::new(StopReason::Refusal);
+        assert!(super::refusal_message_from_response(&bare).is_none());
     }
 
     /// OpenCode regression: a mid-turn UsageUpdate notification stores the
