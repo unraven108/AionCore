@@ -1007,7 +1007,7 @@ mod tests {
         );
 
         let kiro = repo.get("e044000d").await.unwrap().expect("seeded kiro row");
-        assert!(kiro.icon.is_none());
+        assert_eq!(kiro.icon.as_deref(), Some("/api/assets/logos/acp-registry/kiro.svg"));
     }
 
     #[tokio::test]
