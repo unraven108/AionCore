@@ -4809,9 +4809,9 @@ async fn ensure_runtime_backfills_empty_mcp_snapshot_from_assistant() {
 }
 
 #[tokio::test]
-async fn ensure_runtime_keeps_non_empty_mcp_snapshot() {
+async fn ensure_runtime_keeps_non_empty_auto_mcp_snapshot() {
     let task_mgr = Arc::new(MockTaskManager::new());
-    let (svc, _broadcaster, repo, definition_repo, overlay_repo, _preference_repo, mcp_repo) =
+    let (svc, _broadcaster, repo, definition_repo, overlay_repo, preference_repo, mcp_repo) =
         make_service_with_mock_task_manager_and_mcp_support(task_mgr.clone()).await;
 
     let mcp_a = create_test_mcp(&mcp_repo, "mcp-a").await;
@@ -4823,8 +4823,78 @@ async fn ensure_runtime_keeps_non_empty_mcp_snapshot() {
         "codex",
         "auto",
         "auto",
+        "auto",
+        "[]",
+    )
+    .await;
+    overlay_repo
+        .upsert(&UpsertAssistantOverlayParams {
+            assistant_definition_id: "asstdef_acp_mcp",
+            enabled: true,
+            sort_order: 0,
+            agent_id_override: None,
+            last_used_at: None,
+        })
+        .await
+        .unwrap();
+    preference_repo
+        .upsert_for_user(
+            "user_1",
+            &UpsertAssistantPreferenceParams {
+                assistant_definition_id: "asstdef_acp_mcp",
+                last_model_id: None,
+                last_permission_value: None,
+                last_thought_level_value: None,
+                last_skill_ids: "[]",
+                last_disabled_builtin_skill_ids: "[]",
+                last_mcp_ids: &serde_json::to_string(&vec![mcp_a.clone()]).unwrap(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let conv = create_assistant_backed_conversation(&svc, "user_1", Some("acp"), "codex", "assistant-acp-mcp").await;
+
+    // An `auto` conversation with a non-empty snapshot may be the user's
+    // per-conversation selection; changing the assistant must not rewrite it.
+    upsert_test_assistant_definition_with_mcp(
+        &definition_repo,
+        "asstdef_acp_mcp",
+        "assistant-acp-mcp",
+        "codex",
+        "auto",
+        "auto",
         "fixed",
-        &serde_json::to_string(&vec![mcp_a.clone()]).unwrap(),
+        &serde_json::to_string(&vec![mcp_a.clone(), mcp_b]).unwrap(),
+    )
+    .await;
+
+    svc.ensure_runtime("user_1", &conv.id, &(task_mgr.clone() as Arc<dyn IWorkerTaskManager>))
+        .await
+        .unwrap();
+
+    let after = repo.get("user_1", &conv.id).await.unwrap().unwrap();
+    let after_extra: serde_json::Value = serde_json::from_str(&after.extra).unwrap();
+    assert_eq!(after_extra["mcp_server_ids"], json!(vec![mcp_a]));
+}
+
+#[tokio::test]
+async fn ensure_runtime_refreshes_fixed_mode_snapshot() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, _broadcaster, repo, definition_repo, overlay_repo, _preference_repo, mcp_repo) =
+        make_service_with_mock_task_manager_and_mcp_support(task_mgr.clone()).await;
+
+    // A `fixed` assistant owns its MCP list. An old conversation captured while
+    // the list was empty must follow the definition once a server is added.
+    upsert_test_assistant_definition_with_mcp(
+        &definition_repo,
+        "asstdef_acp_mcp",
+        "assistant-acp-mcp",
+        "codex",
+        "auto",
+        "auto",
+        "fixed",
+        "[]",
     )
     .await;
     overlay_repo
@@ -4839,9 +4909,7 @@ async fn ensure_runtime_keeps_non_empty_mcp_snapshot() {
         .unwrap();
 
     let conv = create_assistant_backed_conversation(&svc, "user_1", Some("acp"), "codex", "assistant-acp-mcp").await;
-
-    // Adding a second MCP must not rewrite a conversation that already had an
-    // explicit snapshot: that snapshot is the user's per-conversation choice.
+    let mcp_a = create_test_mcp(&mcp_repo, "mcp-a").await;
     upsert_test_assistant_definition_with_mcp(
         &definition_repo,
         "asstdef_acp_mcp",
@@ -4850,7 +4918,7 @@ async fn ensure_runtime_keeps_non_empty_mcp_snapshot() {
         "auto",
         "auto",
         "fixed",
-        &serde_json::to_string(&vec![mcp_a.clone(), mcp_b]).unwrap(),
+        &serde_json::to_string(&vec![mcp_a.clone()]).unwrap(),
     )
     .await;
 
@@ -4892,59 +4960,6 @@ async fn ensure_runtime_skips_backfill_when_assistant_has_no_mcp() {
         .unwrap();
 
     let conv = create_assistant_backed_conversation(&svc, "user_1", Some("acp"), "codex", "assistant-acp-mcp").await;
-    svc.ensure_runtime("user_1", &conv.id, &(task_mgr.clone() as Arc<dyn IWorkerTaskManager>))
-        .await
-        .unwrap();
-
-    let after = repo.get("user_1", &conv.id).await.unwrap().unwrap();
-    let after_extra: serde_json::Value = serde_json::from_str(&after.extra).unwrap();
-    assert_eq!(after_extra["mcp_server_ids"], json!([]));
-}
-
-#[tokio::test]
-async fn ensure_runtime_does_not_backfill_fixed_mode_empty_snapshot() {
-    let task_mgr = Arc::new(MockTaskManager::new());
-    let (svc, _broadcaster, repo, definition_repo, overlay_repo, _preference_repo, mcp_repo) =
-        make_service_with_mock_task_manager_and_mcp_support(task_mgr.clone()).await;
-
-    // A `fixed` assistant with an empty list may be an explicit "no MCP"
-    // choice; changing the definition later must not rewrite the conversation.
-    upsert_test_assistant_definition_with_mcp(
-        &definition_repo,
-        "asstdef_acp_mcp",
-        "assistant-acp-mcp",
-        "codex",
-        "auto",
-        "auto",
-        "fixed",
-        "[]",
-    )
-    .await;
-    overlay_repo
-        .upsert(&UpsertAssistantOverlayParams {
-            assistant_definition_id: "asstdef_acp_mcp",
-            enabled: true,
-            sort_order: 0,
-            agent_id_override: None,
-            last_used_at: None,
-        })
-        .await
-        .unwrap();
-
-    let conv = create_assistant_backed_conversation(&svc, "user_1", Some("acp"), "codex", "assistant-acp-mcp").await;
-    let mcp_a = create_test_mcp(&mcp_repo, "mcp-a").await;
-    upsert_test_assistant_definition_with_mcp(
-        &definition_repo,
-        "asstdef_acp_mcp",
-        "assistant-acp-mcp",
-        "codex",
-        "auto",
-        "auto",
-        "fixed",
-        &serde_json::to_string(&vec![mcp_a]).unwrap(),
-    )
-    .await;
-
     svc.ensure_runtime("user_1", &conv.id, &(task_mgr.clone() as Arc<dyn IWorkerTaskManager>))
         .await
         .unwrap();

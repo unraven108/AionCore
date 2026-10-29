@@ -4536,21 +4536,20 @@ impl ConversationService {
         }
 
         // A conversation created while the assistant had no MCP binding keeps
-        // `mcp_server_ids: []` forever unless we backfill it. Do that lazily on
+        // `mcp_server_ids: []` forever unless we refresh it. Do that lazily on
         // the next ensure (first send after the user configured MCP) so the
-        // runtime is rebuilt with the assistant's current binding. Non-empty
-        // snapshots are left alone: they are the user's per-conversation choice.
+        // runtime is rebuilt with the assistant's current binding.
         //
         // Skip while a turn is active: persisting a new snapshot that the
         // running process cannot pick up would leave it permanently stale,
-        // because every later ensure sees a non-empty snapshot and stops
+        // because every later ensure sees a matching snapshot and stops
         // retrying. The next idle ensure will do the work instead.
         let runtime_task = task_manager.get_task(conversation_id);
         let can_recycle_idle_runtime =
             runtime_task.is_none() || self.runtime_state.active_turn_id_for(conversation_id).is_none();
         if can_recycle_idle_runtime {
-            let backfilled_mcp = self.backfill_empty_mcp_snapshot(user_id, conversation_id, &row).await?;
-            if backfilled_mcp && runtime_task.is_some() {
+            let refreshed_mcp = self.refresh_mcp_snapshot(user_id, conversation_id, &row).await?;
+            if refreshed_mcp && runtime_task.is_some() {
                 info!(
                     conversation_id,
                     "MCP snapshot changed; recycling idle runtime before ensure"
@@ -4560,7 +4559,7 @@ impl ConversationService {
                     .await;
             }
         } else {
-            debug!(conversation_id, "Skipping MCP snapshot backfill while a turn is active");
+            debug!(conversation_id, "Skipping MCP snapshot refresh while a turn is active");
         }
 
         let (agent, recovered) = self
@@ -5512,17 +5511,21 @@ impl ConversationService {
         }))
     }
 
-    /// Backfill a conversation whose MCP snapshot was created empty (the
-    /// assistant had no MCP binding at creation) from the assistant's CURRENT
-    /// binding. Only `auto`-mode ACP conversations are eligible: a `fixed`
-    /// snapshot is an explicit per-conversation choice and must not be
-    /// rewritten behind the user's back.
+    /// Refresh a conversation's persisted MCP snapshot from the assistant's
+    /// CURRENT binding.
+    ///
+    /// - `auto` assistants only fill an empty snapshot; a non-empty one may be
+    ///   the user's manual per-conversation selection.
+    /// - `fixed` assistants own their MCP list, so existing conversations
+    ///   follow the definition when it changes. This is what lets an old
+    ///   conversation pick up a newly added MCP instead of staying on the set
+    ///   captured at creation.
     ///
     /// This is the single-chat counterpart to the team refresh path; without
     /// it an existing conversation keeps `mcp_server_ids: []` forever after the
     /// user configures MCP on the assistant, and `load_user_mcp_servers`
     /// injects zero servers into `session/new`.
-    async fn backfill_empty_mcp_snapshot(
+    async fn refresh_mcp_snapshot(
         &self,
         user_id: &str,
         conversation_id: &str,
@@ -5536,13 +5539,10 @@ impl ConversationService {
         let extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap_or_else(|_| serde_json::json!({}));
         // Missing key = legacy conversation: `load_user_mcp_servers` already
         // falls back to every enabled row, so there is nothing to backfill.
-        let empty_snapshot = extra
-            .get("mcp_server_ids")
-            .and_then(serde_json::Value::as_array)
-            .is_some_and(|ids| ids.is_empty());
-        if !empty_snapshot {
+        let Some(persisted_ids) = extra.get("mcp_server_ids").and_then(serde_json::Value::as_array) else {
             return Ok(false);
-        }
+        };
+        let persisted_empty = persisted_ids.is_empty();
 
         let Some(snapshot) = self
             .conversation_repo
@@ -5552,7 +5552,17 @@ impl ConversationService {
         else {
             return Ok(false);
         };
-        if snapshot.default_mcps_mode != "auto" {
+        // `auto` assistants only fill an empty snapshot (a non-empty one may be
+        // the user's manual per-conversation selection). `fixed` assistants own
+        // their MCP list, so existing conversations follow the definition when
+        // it changes — that is what makes an old conversation pick up a newly
+        // added MCP instead of staying on the set captured at creation.
+        let should_refresh = match snapshot.default_mcps_mode.as_str() {
+            "auto" => persisted_empty,
+            "fixed" => true,
+            _ => false,
+        };
+        if !should_refresh {
             return Ok(false);
         }
 
@@ -5569,7 +5579,7 @@ impl ConversationService {
                     conversation_id,
                     assistant_id = %snapshot.assistant_id,
                     error = %error,
-                    "MCP snapshot backfill failed; starting without it"
+                    "MCP snapshot refresh failed; starting without it"
                 );
                 return Ok(false);
             }
@@ -5578,6 +5588,13 @@ impl ConversationService {
             return Ok(false);
         };
         if mcp_snapshot.mcp_server_ids.is_empty() && mcp_snapshot.session_mcp_servers.is_empty() {
+            return Ok(false);
+        }
+        // Avoid recycling an idle runtime on every ensure once the persisted
+        // snapshot already matches the assistant's current binding. This also
+        // keeps a fixed assistant whose list contains only builtins (and thus
+        // has an empty `mcp_server_ids`) from refreshing forever.
+        if persisted_mcp_snapshot(&extra) == mcp_snapshot {
             return Ok(false);
         }
 
@@ -5600,7 +5617,7 @@ impl ConversationService {
             conversation_id,
             count,
             assistant_id = %snapshot.assistant_id,
-            "backfilled empty MCP snapshot from assistant binding"
+            "refreshed MCP snapshot from assistant binding"
         );
         Ok(true)
     }
@@ -5748,6 +5765,16 @@ async fn resolve_acp_mcp_support_policy(
         .unwrap_or_default();
 
     Ok(McpSupportPolicy::from_acp_capabilities(capabilities))
+}
+
+fn persisted_mcp_snapshot(extra: &serde_json::Value) -> McpRuntimeSnapshot {
+    let field = |key: &str| extra.get(key).cloned().unwrap_or(serde_json::Value::Null);
+    McpRuntimeSnapshot {
+        mcp_server_ids: serde_json::from_value(field("mcp_server_ids")).unwrap_or_default(),
+        session_mcp_servers: serde_json::from_value(field("session_mcp_servers")).unwrap_or_default(),
+        mcp_servers: serde_json::from_value(field("mcp_servers")).unwrap_or_default(),
+        mcp_statuses: serde_json::from_value(field("mcp_statuses")).unwrap_or_default(),
+    }
 }
 
 fn upsert_conversation_mcp_status(
