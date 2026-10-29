@@ -14,8 +14,8 @@ use aionui_ai_agent::types::{
     CONVERSATION_RUNTIME_CONTEXT_VERSION, SendMessageData,
 };
 use aionui_ai_agent::{
-    AcpError, AgentAvailabilityFeedbackPort, AgentError, AgentSendError, AgentSessionKind, IWorkerTaskManager,
-    RuntimeTokenService,
+    AcpError, AgentAvailabilityFeedbackPort, AgentError, AgentSendError, AgentSessionKind, CodeBuddyAccountStore,
+    IWorkerTaskManager, RuntimeTokenService,
 };
 
 use aionui_api_types::{
@@ -7048,6 +7048,97 @@ async fn send_message_auto_replays_clean_retryable_acp_error_once() {
         0,
         "first clean retryable error stays hidden when replay succeeds"
     );
+}
+
+#[tokio::test]
+async fn codebuddy_auth_error_fails_over_to_the_next_account() {
+    let (svc, _broadcaster, repo, _default_task_mgr) = make_service();
+    let temp = tempfile::tempdir().unwrap();
+    let store = Arc::new(CodeBuddyAccountStore::new(temp.path()));
+    let now = aionui_common::now_ms();
+    for (id, name, token) in [
+        ("uid-a", "Account A", "token-a-1111"),
+        ("uid-b", "Account B", "token-b-2222"),
+    ] {
+        store
+            .upsert(aionui_ai_agent::codebuddy_accounts::StoredAccount {
+                id: id.to_owned(),
+                name: name.to_owned(),
+                uid: id.to_owned(),
+                access_token: token.to_owned(),
+                refresh_token: Some("refresh-token".to_owned()),
+                domain: Some("www.codebuddy.ai".to_owned()),
+                token_type: "Bearer".to_owned(),
+                expires_at: Some(now + 86_400_000),
+                refresh_expires_at: Some(now + 864_000_000),
+                last_refresh: None,
+                profile_dir: String::new(),
+                source: "import".to_owned(),
+                created_at: now,
+                last_used_at: 0,
+            })
+            .unwrap();
+    }
+    store.activate("uid-a").unwrap();
+    let svc = svc.with_codebuddy_accounts(store.clone());
+
+    let conv = svc
+        .create("user_1", make_create_req_with_backend("codebuddy"))
+        .await
+        .unwrap();
+
+    let first = Arc::new(ScriptedAgent::new(
+        &conv.id,
+        vec![vec![AgentStreamEvent::Error(ErrorEventData {
+            message: "authentication required".into(),
+            code: Some(AgentErrorCode::UserAgentAuthRequired),
+            ownership: None,
+            detail: None,
+            workspace_path: None,
+            retryable: Some(false),
+            feedback_recommended: None,
+            resolution: None,
+        })]],
+    ));
+    let second = Arc::new(ScriptedAgent::new(
+        &conv.id,
+        vec![vec![
+            AgentStreamEvent::Text(TextEventData { content: "done".into() }),
+            AgentStreamEvent::Finish(FinishEventData::default()),
+        ]],
+    ));
+    let task_mgr = Arc::new(RebuildingScriptedTaskManager::new(vec![
+        AgentInstance::Mock(first.clone()),
+        AgentInstance::Mock(second.clone()),
+    ]));
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+
+    svc.send_message("user_1", &conv.id, make_send_req(), &task_mgr_dyn)
+        .await
+        .unwrap();
+    wait_for_turn_released(&svc, &conv.id).await;
+
+    assert_eq!(task_mgr.build_count(), 2);
+    assert_eq!(task_mgr.kill_count(), 1);
+    assert_eq!(
+        store.active().map(|account| account.id),
+        Some("uid-b".to_owned()),
+        "the failed account must be replaced by the next usable one"
+    );
+    assert_eq!(first.sent_contents(), vec!["Hello"]);
+    assert_eq!(second.sent_contents(), vec!["Hello"]);
+
+    let messages = repo_messages_asc(&repo, &conv.id, 20).await;
+    let users = messages
+        .iter()
+        .filter(|message| message.r#type == "text" && message.position.as_deref() == Some("right"))
+        .count();
+    let assistants = messages
+        .iter()
+        .filter(|message| message.r#type == "text" && message.position.as_deref() == Some("left"))
+        .count();
+    assert_eq!(users, 1, "account failover must not insert the user message again");
+    assert_eq!(assistants, 1);
 }
 
 #[tokio::test]

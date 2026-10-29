@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use crate::config::{AppConfig, IdentityMode, derive_encryption_key};
 use aionui_ai_agent::{
-    AcpSessionSyncService, AcpSkillManager, ActiveLeaseRegistry, AgentFactoryDeps, AgentRegistry, IWorkerTaskManager,
-    RuntimeTokenService, WorkerTaskManagerImpl, build_agent_factory,
+    AcpSessionSyncService, AcpSkillManager, ActiveLeaseRegistry, AgentFactoryDeps, AgentRegistry,
+    CodeBuddyAccountStore, IWorkerTaskManager, RuntimeTokenService, WorkerTaskManagerImpl, build_agent_factory,
 };
 use aionui_auth::{CookieConfig, JwtService, QrTokenStore, resolve_encryption_secret, resolve_jwt_secret};
 use aionui_common::OnConversationDelete;
@@ -122,6 +122,7 @@ impl AppServices {
         self.conversation_service = build_conversation_service(ConversationServiceDeps {
             database: &self.database,
             work_dir: self.work_dir.clone(),
+            data_dir: self.data_dir.clone(),
             event_bus: self.event_bus.clone(),
             skill_paths: self.skill_paths.clone(),
             skill_repo: self.skill_repo.clone(),
@@ -392,6 +393,7 @@ impl AppServices {
         let conversation_service = build_conversation_service(ConversationServiceDeps {
             database: &database,
             work_dir: work_dir.clone(),
+            data_dir: data_dir.clone(),
             event_bus: event_bus.clone(),
             skill_paths: skill_paths.clone(),
             skill_repo: skill_repo.clone(),
@@ -467,6 +469,7 @@ impl AppServices {
 struct ConversationServiceDeps<'a> {
     database: &'a Database,
     work_dir: PathBuf,
+    data_dir: PathBuf,
     event_bus: Arc<BroadcastEventBus>,
     skill_paths: Arc<aionui_extension::SkillPaths>,
     skill_repo: Arc<dyn ISkillRepository>,
@@ -500,7 +503,8 @@ fn build_conversation_service(deps: ConversationServiceDeps<'_>) -> Conversation
     )
     .with_runtime_state(deps.conversation_runtime_state)
     .with_runtime_helper_context(deps.runtime_helper_bin, deps.runtime_base_url)
-    .with_runtime_token_service(deps.runtime_token_service);
+    .with_runtime_token_service(deps.runtime_token_service)
+    .with_codebuddy_accounts(Arc::new(CodeBuddyAccountStore::new(deps.data_dir)));
     service.with_mcp_server_repo(Arc::new(SqliteMcpServerRepository::new(deps.database.pool().clone())));
     service.with_assistant_definition_repo(Arc::new(SqliteAssistantDefinitionRepository::new(
         deps.database.pool().clone(),

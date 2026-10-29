@@ -200,6 +200,58 @@ impl CodeBuddyAccountStore {
         Ok(true)
     }
 
+    /// Next account to use when the active one fails. Excludes the active
+    /// account and accounts that can neither present a valid access token nor
+    /// renew one; prefers the least recently used so retries spread across the
+    /// library instead of hammering one account.
+    pub fn next_usable_account(&self, now: i64) -> Option<StoredAccount> {
+        let file = self.read();
+        let active_id = file.active_id.as_deref();
+        let mut candidates: Vec<StoredAccount> = file
+            .accounts
+            .into_iter()
+            .filter(|account| Some(account.id.as_str()) != active_id)
+            .filter(|account| usable_for_failover(account, now))
+            .collect();
+        candidates.sort_by(|left, right| {
+            left.last_used_at
+                .cmp(&right.last_used_at)
+                .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+        });
+        candidates.into_iter().next()
+    }
+
+    /// Activate the account chosen by [`Self::next_usable_account`].
+    ///
+    /// Returns the newly active account, or `None` when there is no other
+    /// usable account or the library cannot be written.
+    pub fn activate_next_usable(&self) -> Option<StoredAccount> {
+        let now = aionui_common::now_ms();
+        let mut file = self.read();
+        let active_id = file.active_id.clone();
+        let next_id = {
+            let mut candidates: Vec<&StoredAccount> = file
+                .accounts
+                .iter()
+                .filter(|account| Some(&account.id) != active_id.as_ref())
+                .filter(|account| usable_for_failover(account, now))
+                .collect();
+            candidates.sort_by(|left, right| {
+                left.last_used_at
+                    .cmp(&right.last_used_at)
+                    .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+            });
+            candidates.first().map(|account| account.id.clone())?
+        };
+
+        file.active_id = Some(next_id.clone());
+        let next = file.accounts.iter_mut().find(|account| account.id == next_id)?;
+        next.last_used_at = now;
+        let activated = next.clone();
+        self.write(&file).ok()?;
+        Some(activated)
+    }
+
     pub fn remove(&self, id: &str) -> std::io::Result<bool> {
         let mut file = self.read();
         let before = file.accounts.len();
@@ -272,6 +324,18 @@ fn preview_token(token: &str) -> String {
 
 fn has_refresh_token(account: &StoredAccount) -> bool {
     account.refresh_token.as_deref().is_some_and(|token| !token.is_empty())
+}
+
+/// Whether an account can still be tried after another one failed.
+///
+/// A valid access token is always enough. An expired access token is still
+/// usable when a refresh token exists and has not itself expired (an unknown
+/// refresh-token expiry is treated as still usable).
+fn usable_for_failover(account: &StoredAccount, now: i64) -> bool {
+    if account.expires_at.is_none_or(|at| at > now) {
+        return true;
+    }
+    has_refresh_token(account) && account.refresh_expires_at.is_none_or(|at| at > now)
 }
 
 fn restrict_permissions(path: &Path) {
@@ -404,5 +468,44 @@ mod tests {
         let without_refresh = views.iter().find(|view| view.id == "uid-b").unwrap();
         assert!(with_refresh.can_refresh);
         assert!(!without_refresh.can_refresh);
+    }
+
+    #[test]
+    fn next_usable_account_skips_the_active_and_dead_accounts() {
+        let (_dir, store) = temp_store();
+        let now = aionui_common::now_ms();
+        store.upsert(account("uid-a", "token-aaaaaa-1111")).unwrap();
+        let mut expired_no_refresh = account("uid-b", "token-bbbbbb-2222");
+        expired_no_refresh.expires_at = Some(now - 1_000);
+        expired_no_refresh.refresh_token = None;
+        store.upsert(expired_no_refresh).unwrap();
+        let mut expired_but_renewable = account("uid-c", "token-cccccc-3333");
+        expired_but_renewable.expires_at = Some(now - 1_000);
+        expired_but_renewable.refresh_expires_at = Some(now + 86_400_000);
+        store.upsert(expired_but_renewable).unwrap();
+
+        store.activate("uid-a").unwrap();
+        let next = store.next_usable_account(now).expect("renewable account");
+        assert_eq!(next.id, "uid-c");
+    }
+
+    #[test]
+    fn activate_next_usable_persists_the_switch() {
+        let (_dir, store) = temp_store();
+        store.upsert(account("uid-a", "token-aaaaaa-1111")).unwrap();
+        store.upsert(account("uid-b", "token-bbbbbb-2222")).unwrap();
+        store.activate("uid-a").unwrap();
+
+        let activated = store.activate_next_usable().expect("next account");
+        assert_eq!(activated.id, "uid-b");
+        assert_eq!(store.active().map(|account| account.id), Some("uid-b".to_owned()));
+        assert!(activated.last_used_at > 0);
+    }
+
+    #[test]
+    fn activate_next_usable_returns_none_without_an_alternative() {
+        let (_dir, store) = temp_store();
+        store.upsert(account("uid-a", "token-aaaaaa-1111")).unwrap();
+        assert!(store.activate_next_usable().is_none());
     }
 }

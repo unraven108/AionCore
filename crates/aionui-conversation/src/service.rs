@@ -6,8 +6,9 @@ use std::sync::Arc;
 use aionui_ai_agent::session_context::{AgentSessionContext, AgentSessionKind};
 use aionui_ai_agent::types::BuildTaskOptions;
 use aionui_ai_agent::{
-    ActiveLeaseRegistry, AgentAvailabilityFeedbackPort, AgentError, AgentInstance, AgentSendError, IWorkerTaskManager,
-    RuntimeTokenScope, RuntimeTokenService, TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
+    ActiveLeaseRegistry, AgentAvailabilityFeedbackPort, AgentError, AgentInstance, AgentSendError,
+    CodeBuddyAccountStore, IWorkerTaskManager, RuntimeTokenScope, RuntimeTokenService,
+    TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
 };
 
 use crate::message_cursor::{decode_message_cursor, encode_message_cursor};
@@ -341,6 +342,9 @@ pub struct ConversationService {
     runtime_helper_bin: Option<String>,
     runtime_base_url: Option<String>,
     runtime_token_service: Option<Arc<RuntimeTokenService>>,
+    /// Optional CodeBuddy library used to fail over to another account when a
+    /// turn hits an auth/quota rejection. `None` disables failover entirely.
+    codebuddy_accounts: Option<Arc<CodeBuddyAccountStore>>,
 
     /// One background-stream watcher per LIVE Session instance (keyed by
     /// conversation id; value remembers the instance pointer so a rebuilt
@@ -425,6 +429,7 @@ impl ConversationService {
             runtime_helper_bin: None,
             runtime_base_url: None,
             runtime_token_service: None,
+            codebuddy_accounts: None,
             background_watchers: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
 
             conversation_repo,
@@ -436,6 +441,17 @@ impl ConversationService {
     pub fn with_runtime_state(mut self, runtime_state: Arc<ConversationRuntimeStateService>) -> Self {
         self.runtime_state = runtime_state;
         self
+    }
+
+    /// Attach the CodeBuddy account library so a turn can fail over to the
+    /// next usable account instead of failing outright.
+    pub fn with_codebuddy_accounts(mut self, store: Arc<CodeBuddyAccountStore>) -> Self {
+        self.codebuddy_accounts = Some(store);
+        self
+    }
+
+    pub(crate) fn codebuddy_accounts(&self) -> Option<&Arc<CodeBuddyAccountStore>> {
+        self.codebuddy_accounts.as_ref()
     }
 
     pub fn with_runtime_helper_context(mut self, helper_bin: String, base_url: String) -> Self {

@@ -95,6 +95,40 @@ impl ConversationTurnOrchestrator {
         });
     }
 
+    /// Switch away from a dead/exhausted CodeBuddy account and prepare the
+    /// rebuild. Returns the new account name when a switch happened.
+    async fn try_codebuddy_account_failover(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        build_options: &mut BuildTaskOptions,
+        attempt: &TurnAttemptResult,
+    ) -> Option<String> {
+        let reason = should_failover_codebuddy(attempt.backend.as_deref(), &attempt.outcome)?;
+        let store = self.service.codebuddy_accounts()?;
+        let previous = store.active().map(|account| account.id);
+        let next = store.activate_next_usable()?;
+
+        // The account is injected into the CLI environment at spawn time, so
+        // the running process must be recycled before the retry. The old
+        // profile's session id is not resumable under the new account either.
+        self.service
+            .evict_acp_task_for_account_failover(user_id, conversation_id, &self.task_manager)
+            .await;
+        self.service
+            .refresh_resume_anchor_for_replay(conversation_id, build_options)
+            .await;
+
+        info!(
+            conversation_id,
+            reason = ?reason,
+            from_account = previous.as_deref().unwrap_or("none"),
+            to_account = %next.id,
+            "CodeBuddy account failover: switched account and replaying turn"
+        );
+        Some(next.name)
+    }
+
     async fn run_attempt(&self, input: TurnAttemptInput) -> Result<TurnAttemptResult, ConversationTurnResult> {
         let build_started_at = now_ms();
         let availability_agent_id = availability_agent_id(&input.build_options);
@@ -461,6 +495,7 @@ impl ConversationTurnOrchestrator {
     pub(crate) async fn run_user_turn(self, mut input: TurnStartInput) -> ConversationTurnResult {
         let mut turn_claim = input.turn_claim;
         let conv_id = input.conversation.id.clone();
+        let user_id = input.user_id.clone();
         let turn_id = input.turn_id.clone();
         let runtime_state = self.service.runtime_state();
         let allowed_skill_names = input.build_options.context.skills.clone();
@@ -473,6 +508,7 @@ impl ConversationTurnOrchestrator {
             inject_skills: input.inject_skills,
         };
         let mut replayed = false;
+        let mut failover_attempted = false;
         let superseding_tips = SupersedingTipTotals::default();
         let mut replay_started_at = None;
         let mut final_error_message;
@@ -509,6 +545,26 @@ impl ConversationTurnOrchestrator {
             // Track the final attempt's auth signal so the post-loop availability
             // write-back can reflect "needs sign-in" (last iteration wins).
             auth_failure = terminal_is_auth_failure(&attempt_result.outcome);
+
+            // A CodeBuddy turn can fail before producing anything because the
+            // active account is dead or out of quota. Switch to the next usable
+            // account and replay the same prompt once. This must run BEFORE the
+            // clean-finish break below: a quota refusal is a WarningTip, so its
+            // terminal is `Finish`, not `Error`.
+            if !failover_attempted
+                && let Some(account_name) = self
+                    .try_codebuddy_account_failover(&user_id, &conv_id, &mut input.build_options, &attempt_result)
+                    .await
+            {
+                failover_attempted = true;
+                info!(
+                    conversation_id = %conv_id,
+                    turn_id = %turn_id,
+                    account = %account_name,
+                    "conversation turn retrying with the next CodeBuddy account"
+                );
+                continue;
+            }
 
             let lifecycle = runtime_state.lifecycle_for(&conv_id);
             if !attempt_result.outcome.terminal.is_error() {
@@ -857,6 +913,101 @@ async fn record_agent_session_success(service: &ConversationService, user_id: &s
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodeBuddyFailoverReason {
+    Auth,
+    Quota,
+}
+
+const AUTH_FAILOVER_MARKERS: &[&str] = &[
+    "401",
+    "403",
+    "unauthorized",
+    "authentication",
+    "token expired",
+    "invalid token",
+    "sign in",
+    "log in",
+    "登录",
+    "认证",
+];
+const QUOTA_FAILOVER_MARKERS: &[&str] = &[
+    "429",
+    "quota",
+    "usage limit",
+    "rate limit",
+    "credit",
+    "balance",
+    "额度",
+    "使用量",
+    "频率限制",
+    "余额",
+];
+
+/// Whether this attempt should move to another CodeBuddy account.
+///
+/// Gated on the backend and on `safe_to_auto_replay`: a turn that already
+/// produced visible output or tool side effects must not be replayed under
+/// another account (that would duplicate work). A quota refusal is a clean
+/// `Finish` with a warning tip, so it is safe by definition.
+fn should_failover_codebuddy(backend: Option<&str>, outcome: &RelayOutcome) -> Option<CodeBuddyFailoverReason> {
+    if backend != Some("codebuddy") {
+        return None;
+    }
+    codebuddy_failover_reason(outcome)
+}
+
+fn codebuddy_failover_reason(outcome: &RelayOutcome) -> Option<CodeBuddyFailoverReason> {
+    if !outcome.attempt.safe_to_auto_replay() {
+        return None;
+    }
+
+    let code = outcome.terminal.code();
+    if matches!(
+        code,
+        Some(
+            AgentErrorCode::UserAgentAuthRequired
+                | AgentErrorCode::UserLlmProviderAuthFailed
+                | AgentErrorCode::UserLlmProviderPermissionDenied
+        )
+    ) {
+        return Some(CodeBuddyFailoverReason::Auth);
+    }
+    if matches!(
+        code,
+        Some(AgentErrorCode::UserLlmProviderRateLimited | AgentErrorCode::UserLlmProviderBillingRequired)
+    ) {
+        return Some(CodeBuddyFailoverReason::Quota);
+    }
+
+    match outcome.attempt.refusal_status {
+        Some(401 | 403) => return Some(CodeBuddyFailoverReason::Auth),
+        Some(429) => return Some(CodeBuddyFailoverReason::Quota),
+        _ => {}
+    }
+
+    let mut text = String::new();
+    if let Some(error) = &outcome.attempt.terminal_error {
+        if let Some(detail) = &error.detail {
+            text.push_str(detail);
+            text.push('\n');
+        }
+        text.push_str(&error.message);
+    }
+    if let Some(refusal) = &outcome.attempt.refusal_message {
+        text.push('\n');
+        text.push_str(refusal);
+    }
+    let lower = text.to_lowercase();
+    if AUTH_FAILOVER_MARKERS.iter().any(|marker| lower.contains(marker)) {
+        return Some(CodeBuddyFailoverReason::Auth);
+    }
+    if QUOTA_FAILOVER_MARKERS.iter().any(|marker| lower.contains(marker)) {
+        return Some(CodeBuddyFailoverReason::Quota);
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -882,6 +1033,56 @@ mod tests {
             },
             attempt: TurnAttemptSummary::default(),
         }
+    }
+
+    fn refusal_outcome(message: &str, status: Option<i64>) -> RelayOutcome {
+        let mut outcome = finish_outcome(false);
+        outcome.attempt.refusal_message = Some(message.to_owned());
+        outcome.attempt.refusal_status = status;
+        outcome
+    }
+
+    #[test]
+    fn codebuddy_auth_and_quota_error_codes_request_failover() {
+        assert_eq!(
+            should_failover_codebuddy(Some("codebuddy"), &error_outcome(AgentErrorCode::UserAgentAuthRequired)),
+            Some(CodeBuddyFailoverReason::Auth)
+        );
+        assert_eq!(
+            should_failover_codebuddy(
+                Some("codebuddy"),
+                &error_outcome(AgentErrorCode::UserLlmProviderRateLimited)
+            ),
+            Some(CodeBuddyFailoverReason::Quota)
+        );
+    }
+
+    #[test]
+    fn codebuddy_quota_refusal_requests_failover_even_though_it_is_a_finish() {
+        let outcome = refusal_outcome("429 usage limit reached", Some(429));
+        assert_eq!(
+            should_failover_codebuddy(Some("codebuddy"), &outcome),
+            Some(CodeBuddyFailoverReason::Quota)
+        );
+    }
+
+    #[test]
+    fn content_refusal_does_not_request_failover() {
+        let outcome = refusal_outcome("I can't help with that request", None);
+        assert_eq!(should_failover_codebuddy(Some("codebuddy"), &outcome), None);
+    }
+
+    #[test]
+    fn visible_output_blocks_failover() {
+        let mut outcome = error_outcome(AgentErrorCode::UserAgentAuthRequired);
+        outcome.attempt.saw_visible_output = true;
+        assert_eq!(should_failover_codebuddy(Some("codebuddy"), &outcome), None);
+    }
+
+    #[test]
+    fn other_backends_never_request_codebuddy_failover() {
+        let outcome = error_outcome(AgentErrorCode::UserAgentAuthRequired);
+        assert_eq!(should_failover_codebuddy(Some("codex"), &outcome), None);
     }
 
     // ELECTRON-3Q0: cron forces codex's canonical full-access id (`agent-full-access`,

@@ -209,6 +209,12 @@ pub struct TurnAttemptSummary {
     /// orchestrator reflect "needs auth" into the agent's availability even
     /// though the turn itself is not an error.
     pub needs_auth: bool,
+    /// CodeBuddy refusal text/status captured from `ACP_EMPTY_TURN_REFUSAL`.
+    /// Attempt-local: a quota refusal must trigger account failover before the
+    /// turn is reported as a clean finish, but it must not leak into the
+    /// aggregate summary of a later successful retry.
+    pub refusal_message: Option<String>,
+    pub refusal_status: Option<i64>,
 }
 
 impl TurnAttemptSummary {
@@ -756,6 +762,13 @@ impl StreamRelay {
                             }
                             if data.code.as_deref() == Some("ACP_EMPTY_TURN_NEEDS_AUTH") {
                                 attempt.needs_auth = true;
+                            }
+                            if data.code.as_deref() == Some("ACP_EMPTY_TURN_REFUSAL")
+                                && let Some(params) = &data.params
+                            {
+                                attempt.refusal_message =
+                                    params.get("message").and_then(|value| value.as_str()).map(str::to_owned);
+                                attempt.refusal_status = params.get("statusCode").and_then(|value| value.as_i64());
                             }
                             // A card that supersedes itself gets this turn's
                             // running totals before it goes anywhere, so the
@@ -1548,6 +1561,45 @@ mod tests {
             "needs-auth empty turn is a benign finish"
         );
         assert!(outcome.attempt.needs_auth, "needs-auth tip must set the summary flag");
+    }
+
+    #[tokio::test]
+    async fn refusal_tip_records_message_and_status_on_the_attempt() {
+        use aionui_ai_agent::protocol::events::{TipType, TipsEventData};
+
+        let repo = Arc::new(RecordingRepo::new());
+        let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
+        let (tx, _) = broadcast::channel(64);
+        let relay = StreamRelay::new(
+            "conv-1".into(),
+            "asst-1".into(),
+            "turn-1".into(),
+            "user-1".into(),
+            repo.clone(),
+            bus.clone(),
+        );
+        let rx = tx.subscribe();
+
+        tx.send(AgentStreamEvent::Tips(TipsEventData {
+            content: String::new(),
+            tip_type: TipType::Warning,
+            code: Some("ACP_EMPTY_TURN_REFUSAL".into()),
+            params: Some(serde_json::json!({
+                "message": "429 usage limit reached",
+                "statusCode": 429
+            })),
+            supersedes_key: None,
+        }))
+        .unwrap();
+        tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
+
+        let outcome = relay.consume(rx).await;
+        assert_eq!(outcome.terminal, RelayTerminal::Finish);
+        assert_eq!(outcome.attempt.refusal_status, Some(429));
+        assert_eq!(
+            outcome.attempt.refusal_message.as_deref(),
+            Some("429 usage limit reached")
+        );
     }
 
     #[tokio::test]

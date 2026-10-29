@@ -276,6 +276,59 @@ impl ConversationService {
         }
     }
 
+    pub(crate) async fn evict_acp_task_for_account_failover(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        task_manager: &Arc<dyn IWorkerTaskManager>,
+    ) {
+        let started_at = now_ms();
+        task_manager
+            .kill_and_wait(conversation_id, Some(AgentKillReason::AgentErrorRecovery))
+            .await;
+        self.clear_persisted_acp_session_for_account_switch(user_id, conversation_id)
+            .await;
+        info!(
+            conversation_id,
+            elapsed_ms = now_ms().saturating_sub(started_at),
+            reason = ?AgentKillReason::AgentErrorRecovery,
+            "ACP task evicted for CodeBuddy account failover"
+        );
+    }
+
+    /// A session created under one CodeBuddy profile cannot be resumed under
+    /// another account's `CODEBUDDY_CONFIG_DIR`, so the failover replay must
+    /// start fresh. Unlike `clear_persisted_acp_session_after_disown`, this is
+    /// unconditional: the error may be a quota refusal with no error code.
+    pub(crate) async fn clear_persisted_acp_session_for_account_switch(&self, user_id: &str, conversation_id: &str) {
+        if !self
+            .runtime_persistence()
+            .allows(conversation_id, RuntimeWriteKind::AcpRecoveryCleanup)
+        {
+            return;
+        }
+
+        match self
+            .acp_session_repo()
+            .clear_session_id_for_user(user_id, conversation_id)
+            .await
+        {
+            Ok(true) => info!(
+                conversation_id,
+                reason = ?AgentKillReason::AgentErrorRecovery,
+                "Cleared persisted ACP session id for CodeBuddy account failover"
+            ),
+            Ok(false) => {}
+            Err(err) => warn!(
+                user_id,
+                conversation_id,
+                error = %err,
+                reason = ?AgentKillReason::AgentErrorRecovery,
+                "Failed to clear persisted ACP session id for CodeBuddy account failover"
+            ),
+        }
+    }
+
     pub(crate) async fn evict_acp_task_after_terminal_error(
         &self,
         user_id: &str,

@@ -414,11 +414,17 @@ impl AcpAgentManager {
         );
         // CodeBuddy reports *why* it refused on the prompt response, and that
         // text already names this account's own reset time (quota windows are
-        // per account). Keep it instead of the generic refusal copy.
+        // per account). Keep it instead of the generic refusal copy. The
+        // status code rides along so the orchestrator can tell an account
+        // quota/auth failure apart from a content refusal.
         if let PromptOutcome::WarningTip { tips, .. } = &mut outcome
-            && let Some(message) = refusal_message_from_response(&prompt_response)
+            && let Some((message, status_code)) = refusal_details_from_response(&prompt_response)
         {
-            tips.params = Some(serde_json::json!({ "message": message }));
+            let mut params = serde_json::json!({ "message": message });
+            if let Some(status_code) = status_code {
+                params["statusCode"] = serde_json::json!(status_code);
+            }
+            tips.params = Some(params);
         }
         Ok(outcome)
     }
@@ -682,7 +688,10 @@ fn end_turn_usage_frame_from_response(response: &PromptResponse) -> Option<Value
 /// The text is returned verbatim: a quota reset time is specific to the
 /// account that hit the limit, so the client must not replace it with generic
 /// copy.
-fn refusal_message_from_response(response: &PromptResponse) -> Option<String> {
+/// The CodeBuddy refusal envelope also carries the upstream HTTP status
+/// (`data.statusCode`), which distinguishes quota/auth failures from ordinary
+/// content refusals.
+fn refusal_details_from_response(response: &PromptResponse) -> Option<(String, Option<i64>)> {
     let raw = response.meta.as_ref()?.get("codebuddy.ai/errorMessage")?.as_str()?;
     let parsed = serde_json::from_str::<Value>(raw).unwrap_or_else(|_| Value::String(raw.to_owned()));
     let message = parsed
@@ -690,7 +699,14 @@ fn refusal_message_from_response(response: &PromptResponse) -> Option<String> {
         .and_then(Value::as_str)
         .or_else(|| parsed.as_str())?
         .trim();
-    (!message.is_empty()).then(|| message.to_owned())
+    if message.is_empty() {
+        return None;
+    }
+    let status_code = parsed
+        .get("data")
+        .and_then(|data| data.get("statusCode"))
+        .and_then(Value::as_i64);
+    Some((message.to_owned(), status_code))
 }
 
 /// Carry previously-reported fields the end-of-turn write doesn't know —
@@ -945,14 +961,16 @@ mod tests {
         });
         let response = PromptResponse::new(StopReason::Refusal).meta(meta.as_object().cloned().expect("meta object"));
 
+        let (message, status_code) = super::refusal_details_from_response(&response).expect("details");
         assert_eq!(
-            super::refusal_message_from_response(&response).as_deref(),
-            Some("429 您的使用量已超出频率限制，将在 2026-10-28 11:18:30 UTC+8 重置")
+            message,
+            "429 您的使用量已超出频率限制，将在 2026-10-28 11:18:30 UTC+8 重置"
         );
+        assert_eq!(status_code, Some(429));
 
         // Responses without the dialect keep the generic copy.
         let bare = PromptResponse::new(StopReason::Refusal);
-        assert!(super::refusal_message_from_response(&bare).is_none());
+        assert!(super::refusal_details_from_response(&bare).is_none());
     }
 
     /// OpenCode regression: a mid-turn UsageUpdate notification stores the
