@@ -21,11 +21,15 @@ mod import;
 mod login;
 mod refresh;
 mod usage;
+mod verify;
 
 pub use auth_file::{AuthFileInfo, auth_dir, read_current, scan_history};
 pub use import::{ImportSummary, import_cockpit_export};
 pub use login::{LoginManager, LoginSessionView, LoginStart, LoginStatus};
-pub use refresh::{adopt_live_for_current, backfill_from_history, ensure_fresh};
+pub use refresh::{
+    RefreshSummary, adopt_live_for_current, backfill_from_history, ensure_fresh, needs_refresh, refresh_expiring,
+};
+pub use verify::{VerifyResult, VerifyStatus, verify_account};
 
 use std::path::{Path, PathBuf};
 
@@ -85,6 +89,8 @@ pub struct AccountView {
     pub source: String,
     pub is_active: bool,
     pub is_expired: bool,
+    /// Whether a refresh token is stored, i.e. automatic renewal can work.
+    pub can_refresh: bool,
     /// Credits this account spent since local midnight. `0.0` when unknown.
     pub today_credits: f64,
 }
@@ -224,6 +230,7 @@ impl CodeBuddyAccountStore {
             source: account.source.clone(),
             is_active: active_id.is_some_and(|id| id == account.id),
             is_expired: account.expires_at.is_some_and(|at| at <= aionui_common::now_ms()),
+            can_refresh: has_refresh_token(account),
             today_credits: 0.0,
         }
     }
@@ -261,6 +268,10 @@ fn preview_token(token: &str) -> String {
     let head: String = chars[..TOKEN_PREVIEW_HEAD].iter().collect();
     let tail: String = chars[chars.len() - TOKEN_PREVIEW_TAIL..].iter().collect();
     format!("{head}…{tail}")
+}
+
+fn has_refresh_token(account: &StoredAccount) -> bool {
+    account.refresh_token.as_deref().is_some_and(|token| !token.is_empty())
 }
 
 fn restrict_permissions(path: &Path) {
@@ -378,5 +389,20 @@ mod tests {
         store.upsert(expired).unwrap();
         let (views, _) = store.views();
         assert!(views[0].is_expired);
+    }
+
+    #[test]
+    fn view_reports_whether_automatic_renewal_is_possible() {
+        let (_dir, store) = temp_store();
+        store.upsert(account("uid-a", "token-aaaaaa-1111")).unwrap();
+        let mut no_refresh = account("uid-b", "token-bbbbbb-2222");
+        no_refresh.refresh_token = None;
+        store.upsert(no_refresh).unwrap();
+
+        let (views, _) = store.views();
+        let with_refresh = views.iter().find(|view| view.id == "uid-a").unwrap();
+        let without_refresh = views.iter().find(|view| view.id == "uid-b").unwrap();
+        assert!(with_refresh.can_refresh);
+        assert!(!without_refresh.can_refresh);
     }
 }

@@ -6,10 +6,12 @@
 //! affects how the CodeBuddy ACP process is spawned.
 //!
 //! - `GET    /api/codebuddy/accounts` — account library + active account
+//! - `POST   /api/codebuddy/accounts/refresh` — renew tokens close to expiry
 //! - `POST   /api/codebuddy/accounts/scan` — discover accounts in CodeBuddy's auth dir
 //! - `POST   /api/codebuddy/accounts/import` — save a discovered account
 //! - `POST   /api/codebuddy/accounts/import-file` — import a cockpit-tools JSON export
 //! - `POST   /api/codebuddy/accounts/{id}/activate` — switch active account
+//! - `POST   /api/codebuddy/accounts/{id}/verify` — check that a token still works
 //! - `DELETE /api/codebuddy/accounts/{id}` — remove from the library
 //! - `POST   /api/codebuddy/accounts/login` — start browser sign-in
 //! - `GET    /api/codebuddy/accounts/login/{sid}` — poll the login session
@@ -26,8 +28,9 @@ use aionui_api_types::ApiResponse;
 use aionui_common::ApiError;
 
 use crate::codebuddy_accounts::{
-    AccountView, CodeBuddyAccountStore, ImportSummary, LoginManager, LoginSessionView, LoginStart,
-    adopt_live_for_current, auth_file, backfill_from_history, ensure_fresh, import_cockpit_export, stored_account_from,
+    AccountView, CodeBuddyAccountStore, ImportSummary, LoginManager, LoginSessionView, LoginStart, RefreshSummary,
+    VerifyResult, adopt_live_for_current, auth_file, backfill_from_history, ensure_fresh, import_cockpit_export,
+    refresh_expiring, stored_account_from, verify_account,
 };
 
 #[derive(Clone)]
@@ -39,10 +42,12 @@ pub struct CodeBuddyRouterState {
 pub fn codebuddy_account_routes(state: CodeBuddyRouterState) -> Router {
     Router::new()
         .route("/api/codebuddy/accounts", get(list_accounts))
+        .route("/api/codebuddy/accounts/refresh", post(refresh_accounts))
         .route("/api/codebuddy/accounts/scan", post(scan_accounts))
         .route("/api/codebuddy/accounts/import", post(import_account))
         .route("/api/codebuddy/accounts/import-file", post(import_file))
         .route("/api/codebuddy/accounts/{id}/activate", post(activate_account))
+        .route("/api/codebuddy/accounts/{id}/verify", post(verify_stored_account))
         .route("/api/codebuddy/accounts/{id}", delete(remove_account))
         .route("/api/codebuddy/accounts/login", post(start_login))
         .route("/api/codebuddy/accounts/login/{sid}", get(login_status))
@@ -79,6 +84,13 @@ async fn list_accounts(
             .map(|path| path.to_string_lossy().into_owned()),
         current_uid: current.map(|info| info.uid),
     })))
+}
+
+async fn refresh_accounts(
+    State(state): State<CodeBuddyRouterState>,
+) -> Result<Json<ApiResponse<RefreshSummary>>, ApiError> {
+    let summary = refresh_expiring(&state.store).await;
+    Ok(Json(ApiResponse::ok(summary)))
 }
 
 #[derive(Debug, Serialize)]
@@ -223,6 +235,14 @@ async fn activate_account(
         return Err(ApiError::NotFound(format!("account '{id}' not found")));
     }
     list_accounts(State(state)).await
+}
+
+async fn verify_stored_account(
+    State(state): State<CodeBuddyRouterState>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<VerifyResult>>, ApiError> {
+    let result = verify_account(&state.store, &id).await.map_err(ApiError::NotFound)?;
+    Ok(Json(ApiResponse::ok(result)))
 }
 
 async fn remove_account(

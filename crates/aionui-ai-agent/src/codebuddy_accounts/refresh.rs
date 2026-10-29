@@ -18,6 +18,7 @@
 
 use std::time::Duration;
 
+use serde::Serialize;
 use serde_json::Value;
 
 use super::auth_file::{self, AuthFileInfo};
@@ -26,6 +27,9 @@ use super::{CodeBuddyAccountStore, StoredAccount};
 /// Refresh when the access token is this close to expiry. A full day of runway
 /// keeps long sessions alive and still refreshes at most once per token cycle.
 const REFRESH_AHEAD_MS: i64 = 24 * 60 * 60 * 1000;
+/// Also renew when the refresh token itself is about to expire: that is the
+/// last chance to extend the account without a browser sign-in.
+const REFRESH_TOKEN_AHEAD_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 pub(super) const DEFAULT_HOST: &str = "www.codebuddy.ai";
 const REFRESH_PATH: &str = "/v2/plugin/auth/token/refresh";
 const REFRESH_TIMEOUT_SECS: u64 = 15;
@@ -53,12 +57,54 @@ pub struct RefreshedTokens {
 
 /// Whether the account's access token is expired or about to expire.
 pub fn needs_refresh(account: &StoredAccount, now: i64) -> bool {
-    match account.expires_at {
-        // Unknown expiry: keep the token rather than burning a refresh round
-        // trip on every spawn.
-        None => false,
-        Some(expires_at) => expires_at - now <= REFRESH_AHEAD_MS,
+    let access_due = account
+        .expires_at
+        .is_some_and(|expires_at| expires_at - now <= REFRESH_AHEAD_MS);
+    let refresh_due = account
+        .refresh_expires_at
+        .is_some_and(|expires_at| expires_at - now <= REFRESH_TOKEN_AHEAD_MS);
+    access_due || refresh_due
+}
+
+/// Outcome of a proactive renewal sweep.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct RefreshSummary {
+    pub refreshed: usize,
+    pub failed: usize,
+}
+
+/// Renew every account that is close to either token's expiry.
+///
+/// Used by the settings panel and the background alert hook so an idle app
+/// still rotates tokens before they die. Accounts without a refresh token, or
+/// whose refresh token is already rejected, are reported as failed instead of
+/// aborting the sweep.
+pub async fn refresh_expiring(store: &CodeBuddyAccountStore) -> RefreshSummary {
+    let now = aionui_common::now_ms();
+    let accounts = store.list().0;
+    let mut summary = RefreshSummary::default();
+
+    for account in accounts {
+        if !needs_refresh(&account, now) {
+            continue;
+        }
+        let before_access = account.access_token.clone();
+        let before_expires = account.expires_at;
+        let before_refresh_expires = account.refresh_expires_at;
+        let before_last_refresh = account.last_refresh;
+        let updated = ensure_fresh(store, account).await;
+        let changed = updated.access_token != before_access
+            || updated.expires_at != before_expires
+            || updated.refresh_expires_at != before_refresh_expires
+            || updated.last_refresh != before_last_refresh;
+        if changed {
+            summary.refreshed += 1;
+        } else {
+            summary.failed += 1;
+        }
     }
+
+    summary
 }
 
 /// Return an account whose token is valid, refreshing it when possible.
@@ -387,6 +433,17 @@ mod tests {
         assert!(needs_refresh(&stored(Some(now - 1)), now));
         // Unknown expiry is left alone.
         assert!(!needs_refresh(&stored(None), now));
+    }
+
+    #[test]
+    fn renews_before_the_refresh_token_expires_even_when_the_access_token_is_fine() {
+        let now = 1_000_000_000_000;
+        let mut account = stored(Some(now + 30 * 24 * 60 * 60 * 1000));
+        account.refresh_expires_at = Some(now + REFRESH_TOKEN_AHEAD_MS / 2);
+        assert!(needs_refresh(&account, now));
+
+        account.refresh_expires_at = Some(now + 30 * 24 * 60 * 60 * 1000);
+        assert!(!needs_refresh(&account, now));
     }
 
     #[test]
