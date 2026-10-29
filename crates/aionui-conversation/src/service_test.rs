@@ -36,13 +36,13 @@ use aionui_db::models::{
     MessageRow, UpdateAgentHandshakeParams, UpsertAgentMetadataParams,
 };
 use aionui_db::{
-    ConversationFilters, ConversationRowUpdate, CreateAcpSessionParams, DbError, IAcpSessionRepository,
-    IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
-    IAssistantPreferenceRepository, IConversationRepository, MessageRowUpdate, MessageSearchRow, PersistedSessionState,
-    SaveRuntimeStateParams, SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository,
-    SqliteAssistantPreferenceRepository, UpdateAgentAvailabilitySnapshotParams, UpsertAssistantDefinitionParams,
-    UpsertAssistantOverlayParams, UpsertAssistantPreferenceParams, UpsertConversationAssistantSnapshotParams,
-    init_database_memory,
+    ConversationFilters, ConversationRowUpdate, CreateAcpSessionParams, CreateMcpServerParams, DbError,
+    IAcpSessionRepository, IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
+    IAssistantPreferenceRepository, IConversationRepository, IMcpServerRepository, MessageRowUpdate, MessageSearchRow,
+    PersistedSessionState, SaveRuntimeStateParams, SqliteAssistantDefinitionRepository,
+    SqliteAssistantOverlayRepository, SqliteAssistantPreferenceRepository, SqliteMcpServerRepository,
+    UpdateAgentAvailabilitySnapshotParams, UpsertAssistantDefinitionParams, UpsertAssistantOverlayParams,
+    UpsertAssistantPreferenceParams, UpsertConversationAssistantSnapshotParams, init_database_memory,
 };
 use aionui_db::{MessagePageCursor, MessagePageDirection, MessagePageParams, MessagePageResult};
 use aionui_extension::{AssistantRuleDispatcher, ExtensionError};
@@ -1380,6 +1380,54 @@ async fn make_service_with_mock_task_manager_and_assistant_support(
     (svc, broadcaster, repo, definition_repo, overlay_repo, preference_repo)
 }
 
+async fn make_service_with_mock_task_manager_and_mcp_support(
+    task_mgr: Arc<MockTaskManager>,
+) -> (
+    ConversationService,
+    Arc<MockBroadcaster>,
+    Arc<MockRepo>,
+    Arc<SqliteAssistantDefinitionRepository>,
+    Arc<SqliteAssistantOverlayRepository>,
+    Arc<dyn IAssistantPreferenceRepository>,
+    Arc<SqliteMcpServerRepository>,
+) {
+    let repo = Arc::new(MockRepo::new());
+    let broadcaster = Arc::new(MockBroadcaster::new());
+    let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> = Arc::new(StubAgentMetadataRepo);
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr;
+    let svc = ConversationService::new(
+        std::env::temp_dir(),
+        broadcaster.clone(),
+        Arc::new(FixedSkillResolver { names: vec![] }),
+        task_mgr_dyn,
+        repo.clone(),
+        agent_metadata_repo,
+        Arc::new(StubAcpSessionRepo::default()),
+    );
+    let db = init_database_memory().await.unwrap();
+    seed_test_user(db.pool(), "user_1").await;
+    let definition_repo = Arc::new(SqliteAssistantDefinitionRepository::new(db.pool().clone()));
+    let overlay_repo = Arc::new(SqliteAssistantOverlayRepository::new(db.pool().clone()));
+    let preference_repo: Arc<dyn IAssistantPreferenceRepository> =
+        Arc::new(SqliteAssistantPreferenceRepository::new(db.pool().clone()));
+    let mcp_repo = Arc::new(SqliteMcpServerRepository::new(db.pool().clone()));
+
+    svc.with_assistant_definition_repo(definition_repo.clone());
+    svc.with_assistant_state_repo(overlay_repo.clone());
+    svc.with_assistant_preference_repo(preference_repo.clone());
+    svc.with_mcp_server_repo(mcp_repo.clone());
+
+    (
+        svc,
+        broadcaster,
+        repo,
+        definition_repo,
+        overlay_repo,
+        preference_repo,
+        mcp_repo,
+    )
+}
+
 async fn make_service_with_assistant_support(
     skill_resolver: Arc<dyn crate::skill_resolver::SkillResolver>,
     dispatcher: Arc<dyn AssistantRuleDispatcher>,
@@ -1583,6 +1631,50 @@ async fn upsert_test_assistant_definition_with_thought_level(
         default_disabled_builtin_skill_ids: "[]",
         default_mcps_mode: "auto",
         default_mcp_ids: "[]",
+    })
+    .await
+    .unwrap();
+}
+
+async fn upsert_test_assistant_definition_with_mcp(
+    repo: &SqliteAssistantDefinitionRepository,
+    definition_id: &str,
+    assistant_id: &str,
+    agent_id: &str,
+    default_model_mode: &str,
+    default_permission_mode: &str,
+    default_mcps_mode: &str,
+    default_mcp_ids: &str,
+) {
+    repo.upsert(&UpsertAssistantDefinitionParams {
+        id: definition_id,
+        assistant_id,
+        source: "builtin",
+        owner_type: "system",
+        source_ref: Some(assistant_id),
+        name: assistant_id,
+        name_i18n: "{}",
+        description: Some("desc"),
+        description_i18n: "{}",
+        avatar_type: "emoji",
+        avatar_value: Some("🤖"),
+        agent_id,
+        rule_resource_type: "builtin_asset",
+        rule_resource_ref: Some(assistant_id),
+        recommended_prompts: "[]",
+        recommended_prompts_i18n: "{}",
+        default_model_mode,
+        default_model_value: None,
+        default_permission_mode,
+        default_permission_value: None,
+        default_thought_level_mode: "auto",
+        default_thought_level_value: None,
+        default_skills_mode: "auto",
+        default_skill_ids: "[]",
+        custom_skill_names: "[]",
+        default_disabled_builtin_skill_ids: "[]",
+        default_mcps_mode,
+        default_mcp_ids,
     })
     .await
     .unwrap();
@@ -4647,6 +4739,236 @@ async fn ensure_runtime_uses_existing_agent_snapshot_without_recovery() {
     assert!(result.runtime.has_task);
     assert_eq!(result.config_options[0].id, "model");
     assert_eq!(result.config_options[0].current_value.as_deref(), Some("gpt-5.5"));
+}
+
+#[tokio::test]
+async fn ensure_runtime_backfills_empty_mcp_snapshot_from_assistant() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, _broadcaster, repo, definition_repo, overlay_repo, _preference_repo, mcp_repo) =
+        make_service_with_mock_task_manager_and_mcp_support(task_mgr.clone()).await;
+
+    // Create the conversation while the assistant is still on `auto` with no
+    // MCP preference, which produces the empty snapshot from the bug report.
+    upsert_test_assistant_definition_with_mcp(
+        &definition_repo,
+        "asstdef_acp_mcp",
+        "assistant-acp-mcp",
+        "codex",
+        "auto",
+        "auto",
+        "auto",
+        "[]",
+    )
+    .await;
+    overlay_repo
+        .upsert(&UpsertAssistantOverlayParams {
+            assistant_definition_id: "asstdef_acp_mcp",
+            enabled: true,
+            sort_order: 0,
+            agent_id_override: None,
+            last_used_at: None,
+        })
+        .await
+        .unwrap();
+
+    let conv = create_assistant_backed_conversation(&svc, "user_1", Some("acp"), "codex", "assistant-acp-mcp").await;
+    let before = repo.get("user_1", &conv.id).await.unwrap().unwrap();
+    let before_extra: serde_json::Value = serde_json::from_str(&before.extra).unwrap();
+    assert_eq!(before_extra["mcp_server_ids"], json!([]));
+
+    // Configure MCPs on the assistant after the conversation exists.
+    let mcp_a = create_test_mcp(&mcp_repo, "mcp-a").await;
+    let mcp_b = create_test_mcp(&mcp_repo, "mcp-b").await;
+    let expected = vec![mcp_a, mcp_b];
+    upsert_test_assistant_definition_with_mcp(
+        &definition_repo,
+        "asstdef_acp_mcp",
+        "assistant-acp-mcp",
+        "codex",
+        "auto",
+        "auto",
+        "fixed",
+        &serde_json::to_string(&expected).unwrap(),
+    )
+    .await;
+
+    let result = svc
+        .ensure_runtime("user_1", &conv.id, &(task_mgr.clone() as Arc<dyn IWorkerTaskManager>))
+        .await
+        .unwrap();
+    assert!(result.runtime.has_task);
+
+    let after = repo.get("user_1", &conv.id).await.unwrap().unwrap();
+    let after_extra: serde_json::Value = serde_json::from_str(&after.extra).unwrap();
+    assert_eq!(after_extra["mcp_server_ids"], json!(expected));
+    let snapshot = repo.get_assistant_snapshot("user_1", &conv.id).await.unwrap().unwrap();
+    assert_eq!(
+        serde_json::from_str::<Vec<String>>(&snapshot.resolved_mcp_ids).unwrap(),
+        expected
+    );
+}
+
+#[tokio::test]
+async fn ensure_runtime_keeps_non_empty_mcp_snapshot() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, _broadcaster, repo, definition_repo, overlay_repo, _preference_repo, mcp_repo) =
+        make_service_with_mock_task_manager_and_mcp_support(task_mgr.clone()).await;
+
+    let mcp_a = create_test_mcp(&mcp_repo, "mcp-a").await;
+    let mcp_b = create_test_mcp(&mcp_repo, "mcp-b").await;
+    upsert_test_assistant_definition_with_mcp(
+        &definition_repo,
+        "asstdef_acp_mcp",
+        "assistant-acp-mcp",
+        "codex",
+        "auto",
+        "auto",
+        "fixed",
+        &serde_json::to_string(&vec![mcp_a.clone()]).unwrap(),
+    )
+    .await;
+    overlay_repo
+        .upsert(&UpsertAssistantOverlayParams {
+            assistant_definition_id: "asstdef_acp_mcp",
+            enabled: true,
+            sort_order: 0,
+            agent_id_override: None,
+            last_used_at: None,
+        })
+        .await
+        .unwrap();
+
+    let conv = create_assistant_backed_conversation(&svc, "user_1", Some("acp"), "codex", "assistant-acp-mcp").await;
+
+    // Adding a second MCP must not rewrite a conversation that already had an
+    // explicit snapshot: that snapshot is the user's per-conversation choice.
+    upsert_test_assistant_definition_with_mcp(
+        &definition_repo,
+        "asstdef_acp_mcp",
+        "assistant-acp-mcp",
+        "codex",
+        "auto",
+        "auto",
+        "fixed",
+        &serde_json::to_string(&vec![mcp_a.clone(), mcp_b]).unwrap(),
+    )
+    .await;
+
+    svc.ensure_runtime("user_1", &conv.id, &(task_mgr.clone() as Arc<dyn IWorkerTaskManager>))
+        .await
+        .unwrap();
+
+    let after = repo.get("user_1", &conv.id).await.unwrap().unwrap();
+    let after_extra: serde_json::Value = serde_json::from_str(&after.extra).unwrap();
+    assert_eq!(after_extra["mcp_server_ids"], json!(vec![mcp_a]));
+}
+
+#[tokio::test]
+async fn ensure_runtime_skips_backfill_when_assistant_has_no_mcp() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, _broadcaster, repo, definition_repo, overlay_repo, _preference_repo, _mcp_repo) =
+        make_service_with_mock_task_manager_and_mcp_support(task_mgr.clone()).await;
+
+    upsert_test_assistant_definition_with_mcp(
+        &definition_repo,
+        "asstdef_acp_mcp",
+        "assistant-acp-mcp",
+        "codex",
+        "auto",
+        "auto",
+        "auto",
+        "[]",
+    )
+    .await;
+    overlay_repo
+        .upsert(&UpsertAssistantOverlayParams {
+            assistant_definition_id: "asstdef_acp_mcp",
+            enabled: true,
+            sort_order: 0,
+            agent_id_override: None,
+            last_used_at: None,
+        })
+        .await
+        .unwrap();
+
+    let conv = create_assistant_backed_conversation(&svc, "user_1", Some("acp"), "codex", "assistant-acp-mcp").await;
+    svc.ensure_runtime("user_1", &conv.id, &(task_mgr.clone() as Arc<dyn IWorkerTaskManager>))
+        .await
+        .unwrap();
+
+    let after = repo.get("user_1", &conv.id).await.unwrap().unwrap();
+    let after_extra: serde_json::Value = serde_json::from_str(&after.extra).unwrap();
+    assert_eq!(after_extra["mcp_server_ids"], json!([]));
+}
+
+#[tokio::test]
+async fn ensure_runtime_does_not_backfill_fixed_mode_empty_snapshot() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, _broadcaster, repo, definition_repo, overlay_repo, _preference_repo, mcp_repo) =
+        make_service_with_mock_task_manager_and_mcp_support(task_mgr.clone()).await;
+
+    // A `fixed` assistant with an empty list may be an explicit "no MCP"
+    // choice; changing the definition later must not rewrite the conversation.
+    upsert_test_assistant_definition_with_mcp(
+        &definition_repo,
+        "asstdef_acp_mcp",
+        "assistant-acp-mcp",
+        "codex",
+        "auto",
+        "auto",
+        "fixed",
+        "[]",
+    )
+    .await;
+    overlay_repo
+        .upsert(&UpsertAssistantOverlayParams {
+            assistant_definition_id: "asstdef_acp_mcp",
+            enabled: true,
+            sort_order: 0,
+            agent_id_override: None,
+            last_used_at: None,
+        })
+        .await
+        .unwrap();
+
+    let conv = create_assistant_backed_conversation(&svc, "user_1", Some("acp"), "codex", "assistant-acp-mcp").await;
+    let mcp_a = create_test_mcp(&mcp_repo, "mcp-a").await;
+    upsert_test_assistant_definition_with_mcp(
+        &definition_repo,
+        "asstdef_acp_mcp",
+        "assistant-acp-mcp",
+        "codex",
+        "auto",
+        "auto",
+        "fixed",
+        &serde_json::to_string(&vec![mcp_a]).unwrap(),
+    )
+    .await;
+
+    svc.ensure_runtime("user_1", &conv.id, &(task_mgr.clone() as Arc<dyn IWorkerTaskManager>))
+        .await
+        .unwrap();
+
+    let after = repo.get("user_1", &conv.id).await.unwrap().unwrap();
+    let after_extra: serde_json::Value = serde_json::from_str(&after.extra).unwrap();
+    assert_eq!(after_extra["mcp_server_ids"], json!([]));
+}
+
+async fn create_test_mcp(repo: &SqliteMcpServerRepository, name: &str) -> String {
+    repo.create(CreateMcpServerParams {
+        user_id: "user_1",
+        name,
+        description: None,
+        enabled: true,
+        transport_type: "stdio",
+        transport_config: r#"{"command":"node","args":[]}"#,
+        tools: None,
+        original_json: None,
+        builtin: false,
+    })
+    .await
+    .unwrap()
+    .id
 }
 
 #[tokio::test]

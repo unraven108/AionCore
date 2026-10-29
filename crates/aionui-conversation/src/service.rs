@@ -4535,6 +4535,34 @@ impl ConversationService {
             });
         }
 
+        // A conversation created while the assistant had no MCP binding keeps
+        // `mcp_server_ids: []` forever unless we backfill it. Do that lazily on
+        // the next ensure (first send after the user configured MCP) so the
+        // runtime is rebuilt with the assistant's current binding. Non-empty
+        // snapshots are left alone: they are the user's per-conversation choice.
+        //
+        // Skip while a turn is active: persisting a new snapshot that the
+        // running process cannot pick up would leave it permanently stale,
+        // because every later ensure sees a non-empty snapshot and stops
+        // retrying. The next idle ensure will do the work instead.
+        let runtime_task = task_manager.get_task(conversation_id);
+        let can_recycle_idle_runtime =
+            runtime_task.is_none() || self.runtime_state.active_turn_id_for(conversation_id).is_none();
+        if can_recycle_idle_runtime {
+            let backfilled_mcp = self.backfill_empty_mcp_snapshot(user_id, conversation_id, &row).await?;
+            if backfilled_mcp && runtime_task.is_some() {
+                info!(
+                    conversation_id,
+                    "MCP snapshot changed; recycling idle runtime before ensure"
+                );
+                task_manager
+                    .kill_and_wait(conversation_id, Some(AgentKillReason::RuntimeRestart))
+                    .await;
+            }
+        } else {
+            debug!(conversation_id, "Skipping MCP snapshot backfill while a turn is active");
+        }
+
         let (agent, recovered) = self
             .ensure_runtime_agent(user_id, conversation_id, task_manager, "runtime_ensure")
             .await?;
@@ -5482,6 +5510,143 @@ impl ConversationService {
             session_mcp_servers,
             mcp_statuses,
         }))
+    }
+
+    /// Backfill a conversation whose MCP snapshot was created empty (the
+    /// assistant had no MCP binding at creation) from the assistant's CURRENT
+    /// binding. Only `auto`-mode ACP conversations are eligible: a `fixed`
+    /// snapshot is an explicit per-conversation choice and must not be
+    /// rewritten behind the user's back.
+    ///
+    /// This is the single-chat counterpart to the team refresh path; without
+    /// it an existing conversation keeps `mcp_server_ids: []` forever after the
+    /// user configures MCP on the assistant, and `load_user_mcp_servers`
+    /// injects zero servers into `session/new`.
+    async fn backfill_empty_mcp_snapshot(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        row: &ConversationRow,
+    ) -> Result<bool, ConversationError> {
+        let agent_type: AgentType = string_to_enum(&row.r#type)?;
+        if agent_type != AgentType::Acp {
+            return Ok(false);
+        }
+
+        let extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap_or_else(|_| serde_json::json!({}));
+        // Missing key = legacy conversation: `load_user_mcp_servers` already
+        // falls back to every enabled row, so there is nothing to backfill.
+        let empty_snapshot = extra
+            .get("mcp_server_ids")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|ids| ids.is_empty());
+        if !empty_snapshot {
+            return Ok(false);
+        }
+
+        let Some(snapshot) = self
+            .conversation_repo
+            .get_assistant_snapshot(user_id, conversation_id)
+            .await
+            .map_err(|e| ConversationError::internal(format!("Failed to load assistant snapshot: {e}")))?
+        else {
+            return Ok(false);
+        };
+        if snapshot.default_mcps_mode != "auto" {
+            return Ok(false);
+        }
+
+        let resolved = match self
+            .resolve_assistant_mcp_snapshot(user_id, &snapshot.assistant_id, &agent_type, &extra)
+            .await
+        {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                // MCP backfill is best-effort: a missing assistant/MCP repo or a
+                // transient read failure must not block the conversation from
+                // starting. The next ensure retries.
+                warn!(
+                    conversation_id,
+                    assistant_id = %snapshot.assistant_id,
+                    error = %error,
+                    "MCP snapshot backfill failed; starting without it"
+                );
+                return Ok(false);
+            }
+        };
+        let Some((mcp_snapshot, _fingerprint)) = resolved else {
+            return Ok(false);
+        };
+        if mcp_snapshot.mcp_server_ids.is_empty() && mcp_snapshot.session_mcp_servers.is_empty() {
+            return Ok(false);
+        }
+
+        let count = mcp_snapshot.mcp_server_ids.len() + mcp_snapshot.session_mcp_servers.len();
+        let patch = serde_json::to_value(&mcp_snapshot)
+            .map_err(|e| ConversationError::internal(format!("Failed to serialize MCP snapshot: {e}")))?;
+        self.update_extra(user_id, conversation_id, patch).await?;
+
+        // Keep the persisted assistant snapshot consistent with the runtime
+        // snapshot. Builtin servers live in `session_mcp_servers`, so merge
+        // their ids back in before writing the flat id list.
+        let mut resolved_ids = mcp_snapshot.mcp_server_ids.clone();
+        resolved_ids.extend(mcp_snapshot.session_mcp_servers.iter().map(|server| server.id.clone()));
+        resolved_ids.sort();
+        resolved_ids.dedup();
+        self.persist_assistant_snapshot_mcp_ids(user_id, conversation_id, &resolved_ids)
+            .await?;
+
+        info!(
+            conversation_id,
+            count,
+            assistant_id = %snapshot.assistant_id,
+            "backfilled empty MCP snapshot from assistant binding"
+        );
+        Ok(true)
+    }
+
+    async fn persist_assistant_snapshot_mcp_ids(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        mcp_ids: &[String],
+    ) -> Result<(), ConversationError> {
+        let Some(snapshot) = self
+            .conversation_repo
+            .get_assistant_snapshot(user_id, conversation_id)
+            .await
+            .map_err(|e| ConversationError::internal(format!("Failed to load assistant snapshot: {e}")))?
+        else {
+            return Ok(());
+        };
+        let resolved_mcp_ids = serde_json::to_string(mcp_ids)
+            .map_err(|e| ConversationError::internal(format!("Failed to encode MCP ids: {e}")))?;
+        self.conversation_repo
+            .upsert_assistant_snapshot(
+                user_id,
+                &UpsertConversationAssistantSnapshotParams {
+                    conversation_id: &snapshot.conversation_id,
+                    assistant_definition_id: &snapshot.assistant_definition_id,
+                    assistant_id: &snapshot.assistant_id,
+                    assistant_source: &snapshot.assistant_source,
+                    agent_id: &snapshot.agent_id,
+                    rules_content: &snapshot.rules_content,
+                    default_model_mode: &snapshot.default_model_mode,
+                    resolved_model_id: snapshot.resolved_model_id.as_deref(),
+                    default_permission_mode: &snapshot.default_permission_mode,
+                    resolved_permission_value: snapshot.resolved_permission_value.as_deref(),
+                    default_thought_level_mode: &snapshot.default_thought_level_mode,
+                    resolved_thought_level_value: snapshot.resolved_thought_level_value.as_deref(),
+                    default_skills_mode: &snapshot.default_skills_mode,
+                    resolved_skill_ids: &snapshot.resolved_skill_ids,
+                    resolved_disabled_builtin_skill_ids: &snapshot.resolved_disabled_builtin_skill_ids,
+                    default_mcps_mode: &snapshot.default_mcps_mode,
+                    resolved_mcp_ids: &resolved_mcp_ids,
+                },
+            )
+            .await
+            .map_err(|e| ConversationError::internal(format!("Failed to persist assistant snapshot MCP ids: {e}")))?;
+        Ok(())
     }
 
     /// Resolve and classify one assistant's current MCP binding for an existing
