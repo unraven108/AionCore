@@ -447,17 +447,11 @@ fn stored_from_login(
 }
 
 fn open_browser(url: &str) {
-    // Windows: never route the URL through `cmd /C start`. `cmd` treats an
-    // unquoted `&` as a command separator, so `?platform=CLI&state=…` would be
-    // truncated before the state and the page reports an incomplete link.
-    // `explorer` receives the argument directly and hands it to the default
-    // browser intact.
-    let result = match std::env::consts::OS {
-        "windows" => std::process::Command::new("explorer").arg(url).spawn(),
-        "macos" => std::process::Command::new("open").arg(url).spawn(),
-        _ => std::process::Command::new("xdg-open").arg(url).spawn(),
-    };
-    if let Err(error) = result {
+    // `open` goes through the platform's URL handler (ShellExecute on Windows,
+    // `open` on macOS, `xdg-open` elsewhere). Calling `explorer` directly made
+    // Windows treat URLs with query strings as filesystem paths and open File
+    // Explorer instead of the default browser.
+    if let Err(error) = open::that(url) {
         // The UI also shows the URL, so this is not fatal.
         tracing::warn!(%error, "failed to open the CodeBuddy sign-in page");
     }

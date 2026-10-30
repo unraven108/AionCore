@@ -369,6 +369,7 @@ dependencies = [
  "http 1.4.0",
  "libc",
  "mime_guess",
+ "open",
  "regex",
  "reqwest",
  "rusqlite",

@@ -31,6 +31,7 @@ dirs.workspace = true
 getrandom.workspace = true
 regex.workspace = true
 reqwest.workspace = true
+open.workspace = true
 dashmap.workspace = true
 futures-util.workspace = true
 serde.workspace = true
