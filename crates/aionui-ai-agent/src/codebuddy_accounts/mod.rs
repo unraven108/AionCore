@@ -71,6 +71,10 @@ pub struct StoredAccount {
     /// `login` | `import` | `history`
     #[serde(default)]
     pub source: String,
+    /// When false, automatic failover never switches to this account. The user
+    /// can still activate it manually.
+    #[serde(default = "default_true")]
+    pub auto_switch_enabled: bool,
     #[serde(default)]
     pub created_at: i64,
     #[serde(default)]
@@ -91,6 +95,8 @@ pub struct AccountView {
     pub is_expired: bool,
     /// Whether a refresh token is stored, i.e. automatic renewal can work.
     pub can_refresh: bool,
+    /// Whether automatic failover may switch to this account.
+    pub auto_switch_enabled: bool,
     /// Credits this account spent since local midnight. `0.0` when unknown.
     pub today_credits: f64,
 }
@@ -107,6 +113,10 @@ pub struct AccountsFile {
 
 fn default_version() -> u32 {
     1
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for AccountsFile {
@@ -200,6 +210,21 @@ impl CodeBuddyAccountStore {
         Ok(true)
     }
 
+    /// Allow or forbid automatic failover into an account. Manual activation is
+    /// unaffected. Returns `Ok(false)` when the id is unknown.
+    pub fn set_auto_switch_enabled(&self, id: &str, enabled: bool) -> std::io::Result<bool> {
+        let mut file = self.read();
+        let Some(account) = file.accounts.iter_mut().find(|item| item.id == id) else {
+            return Ok(false);
+        };
+        if account.auto_switch_enabled == enabled {
+            return Ok(true);
+        }
+        account.auto_switch_enabled = enabled;
+        self.write(&file)?;
+        Ok(true)
+    }
+
     /// Next account to use when the active one fails. Excludes the active
     /// account and accounts that can neither present a valid access token nor
     /// renew one; prefers the least recently used so retries spread across the
@@ -283,6 +308,7 @@ impl CodeBuddyAccountStore {
             is_active: active_id.is_some_and(|id| id == account.id),
             is_expired: account.expires_at.is_some_and(|at| at <= aionui_common::now_ms()),
             can_refresh: has_refresh_token(account),
+            auto_switch_enabled: account.auto_switch_enabled,
             today_credits: 0.0,
         }
     }
@@ -330,8 +356,12 @@ fn has_refresh_token(account: &StoredAccount) -> bool {
 ///
 /// A valid access token is always enough. An expired access token is still
 /// usable when a refresh token exists and has not itself expired (an unknown
-/// refresh-token expiry is treated as still usable).
+/// refresh-token expiry is treated as still usable). Accounts the user excluded
+/// from automatic switching are never candidates.
 fn usable_for_failover(account: &StoredAccount, now: i64) -> bool {
+    if !account.auto_switch_enabled {
+        return false;
+    }
     if account.expires_at.is_none_or(|at| at > now) {
         return true;
     }
@@ -366,6 +396,7 @@ pub fn stored_account_from(info: &AuthFileInfo, store: &CodeBuddyAccountStore, s
         last_refresh: info.last_refresh,
         profile_dir: store.profile_dir(&info.uid).to_string_lossy().into_owned(),
         source: source.to_owned(),
+        auto_switch_enabled: true,
         created_at: now,
         last_used_at: 0,
     }
@@ -395,6 +426,7 @@ mod tests {
             last_refresh: None,
             profile_dir: String::new(),
             source: "import".into(),
+            auto_switch_enabled: true,
             created_at: 0,
             last_used_at: 0,
         }
@@ -507,5 +539,76 @@ mod tests {
         let (_dir, store) = temp_store();
         store.upsert(account("uid-a", "token-aaaaaa-1111")).unwrap();
         assert!(store.activate_next_usable().is_none());
+    }
+
+    #[test]
+    fn next_usable_account_skips_accounts_excluded_from_auto_switch() {
+        let (_dir, store) = temp_store();
+        let now = aionui_common::now_ms();
+        store.upsert(account("uid-a", "token-aaaaaa-1111")).unwrap();
+        store.upsert(account("uid-b", "token-bbbbbb-2222")).unwrap();
+        store.upsert(account("uid-c", "token-cccccc-3333")).unwrap();
+        store.activate("uid-a").unwrap();
+        assert!(store.set_auto_switch_enabled("uid-b", false).unwrap());
+
+        let next = store.next_usable_account(now).expect("next account");
+        assert_eq!(next.id, "uid-c", "excluded account must be skipped");
+    }
+
+    #[test]
+    fn activate_next_usable_returns_none_when_every_alternative_is_excluded() {
+        let (_dir, store) = temp_store();
+        store.upsert(account("uid-a", "token-aaaaaa-1111")).unwrap();
+        store.upsert(account("uid-b", "token-bbbbbb-2222")).unwrap();
+        store.activate("uid-a").unwrap();
+        assert!(store.set_auto_switch_enabled("uid-b", false).unwrap());
+
+        assert!(store.activate_next_usable().is_none());
+        assert_eq!(
+            store.active().map(|account| account.id),
+            Some("uid-a".to_owned()),
+            "the active account must stay put when failover has no candidate"
+        );
+    }
+
+    #[test]
+    fn auto_switch_defaults_to_enabled_for_legacy_files() {
+        let (dir, store) = temp_store();
+        let raw = r#"{
+            "version": 1,
+            "active_id": "uid-a",
+            "accounts": [{
+                "id": "uid-a",
+                "name": "Legacy",
+                "uid": "uid-a",
+                "access_token": "token-aaaaaa-1111",
+                "profile_dir": ""
+            }]
+        }"#;
+        std::fs::write(dir.path().join(ACCOUNTS_FILE), raw).unwrap();
+
+        let (views, _) = store.views();
+        assert!(views[0].auto_switch_enabled);
+    }
+
+    #[test]
+    fn set_auto_switch_enabled_persists_and_reports_missing_ids() {
+        let (_dir, store) = temp_store();
+        store.upsert(account("uid-a", "token-aaaaaa-1111")).unwrap();
+
+        assert!(store.set_auto_switch_enabled("uid-a", false).unwrap());
+        let (views, _) = store.views();
+        assert!(!views[0].auto_switch_enabled);
+        assert!(
+            !store
+                .list()
+                .0
+                .into_iter()
+                .find(|account| account.id == "uid-a")
+                .unwrap()
+                .auto_switch_enabled
+        );
+
+        assert!(!store.set_auto_switch_enabled("missing", false).unwrap());
     }
 }

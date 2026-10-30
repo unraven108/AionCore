@@ -404,6 +404,7 @@ mod tests {
             last_refresh: Some(1_000),
             profile_dir: String::new(),
             source: "import".into(),
+            auto_switch_enabled: true,
             created_at: 0,
             last_used_at: 0,
         }

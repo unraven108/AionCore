@@ -7074,6 +7074,7 @@ async fn codebuddy_auth_error_fails_over_to_the_next_account() {
                 last_refresh: None,
                 profile_dir: String::new(),
                 source: "import".to_owned(),
+                auto_switch_enabled: true,
                 created_at: now,
                 last_used_at: 0,
             })

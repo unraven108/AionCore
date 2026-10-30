@@ -113,6 +113,7 @@ fn account_from_export(item: &Value, store: &CodeBuddyAccountStore) -> Option<St
         last_refresh: None,
         profile_dir: store.profile_dir(&uid).to_string_lossy().into_owned(),
         source: "cockpit".to_owned(),
+        auto_switch_enabled: true,
         created_at: now,
         last_used_at: 0,
     })

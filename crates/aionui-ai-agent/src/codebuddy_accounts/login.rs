@@ -137,6 +137,7 @@ impl LoginManager {
                 is_active: false,
                 is_expired: false,
                 can_refresh: account.refresh_token.as_deref().is_some_and(|token| !token.is_empty()),
+                auto_switch_enabled: account.auto_switch_enabled,
                 today_credits: 0.0,
             }),
             auth_url: session.auth_url.clone(),
@@ -441,6 +442,7 @@ fn stored_from_login(
         last_refresh: Some(now),
         profile_dir: store.profile_dir(&profile.uid).to_string_lossy().into_owned(),
         source: "login".to_owned(),
+        auto_switch_enabled: true,
         created_at: now,
         last_used_at: 0,
     }

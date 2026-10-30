@@ -11,6 +11,7 @@
 //! - `POST   /api/codebuddy/accounts/import` — save a discovered account
 //! - `POST   /api/codebuddy/accounts/import-file` — import a cockpit-tools JSON export
 //! - `POST   /api/codebuddy/accounts/{id}/activate` — switch active account
+//! - `POST   /api/codebuddy/accounts/{id}/auto-switch` — allow/forbid failover into an account
 //! - `POST   /api/codebuddy/accounts/{id}/verify` — check that a token still works
 //! - `DELETE /api/codebuddy/accounts/{id}` — remove from the library
 //! - `POST   /api/codebuddy/accounts/login` — start browser sign-in
@@ -47,6 +48,10 @@ pub fn codebuddy_account_routes(state: CodeBuddyRouterState) -> Router {
         .route("/api/codebuddy/accounts/import", post(import_account))
         .route("/api/codebuddy/accounts/import-file", post(import_file))
         .route("/api/codebuddy/accounts/{id}/activate", post(activate_account))
+        .route(
+            "/api/codebuddy/accounts/{id}/auto-switch",
+            post(set_account_auto_switch),
+        )
         .route("/api/codebuddy/accounts/{id}/verify", post(verify_stored_account))
         .route("/api/codebuddy/accounts/{id}", delete(remove_account))
         .route("/api/codebuddy/accounts/login", post(start_login))
@@ -232,6 +237,27 @@ async fn activate_account(
     ensure_fresh(&state.store, account).await;
 
     if !state.store.activate(&id).map_err(io_error)? {
+        return Err(ApiError::NotFound(format!("account '{id}' not found")));
+    }
+    list_accounts(State(state)).await
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AutoSwitchRequest {
+    /// Whether automatic failover may switch to this account.
+    pub enabled: bool,
+}
+
+async fn set_account_auto_switch(
+    State(state): State<CodeBuddyRouterState>,
+    Path(id): Path<String>,
+    Json(request): Json<AutoSwitchRequest>,
+) -> Result<Json<ApiResponse<CodeBuddyAccountsResponse>>, ApiError> {
+    if !state
+        .store
+        .set_auto_switch_enabled(&id, request.enabled)
+        .map_err(io_error)?
+    {
         return Err(ApiError::NotFound(format!("account '{id}' not found")));
     }
     list_accounts(State(state)).await
