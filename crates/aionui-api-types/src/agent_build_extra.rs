@@ -95,6 +95,15 @@ pub struct AcpBuildExtra {
     pub session_mcp_servers: Vec<SessionMcpServer>,
     #[serde(default)]
     pub user_id: Option<String>,
+    /// CodeBuddy account this conversation runs as.
+    ///
+    /// Spawn injects this account's token and `CODEBUDDY_CONFIG_DIR` instead of
+    /// the library-wide active account, so switching accounts in one
+    /// conversation cannot move another conversation onto a different account.
+    /// `None` = no explicit choice yet; follow the active account, which keeps
+    /// pre-existing conversations and other backends on their old behaviour.
+    #[serde(default)]
+    pub codebuddy_account_id: Option<String>,
     /// Present only on a forked conversation (see [`ForkSpec`]). Consumed by
     /// the first session open when no backend session id is bound yet.
     #[serde(default, skip_serializing_if = "Option::is_none")]

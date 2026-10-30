@@ -75,6 +75,7 @@ async fn make_mock_agent(script: &str, backend: &str) -> (Arc<AcpAgentManager>, 
         mcp_server_ids: None,
         session_mcp_servers: vec![],
         user_id: None,
+        codebuddy_account_id: None,
         fork: None,
     };
 

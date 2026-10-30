@@ -225,6 +225,15 @@ impl CodeBuddyAccountStore {
         Ok(true)
     }
 
+    /// The account with this id, if it is still in the library.
+    ///
+    /// Read on spawn for a conversation that pinned its account
+    /// (`extra.codebuddy_account_id`). `None` means the account was removed or
+    /// never existed; callers fall back to [`Self::active`].
+    pub fn get(&self, id: &str) -> Option<StoredAccount> {
+        self.read().accounts.into_iter().find(|account| account.id == id)
+    }
+
     /// Next account to use when the active one fails. Excludes the active
     /// account and accounts that can neither present a valid access token nor
     /// renew one; prefers the least recently used so retries spread across the

@@ -175,6 +175,7 @@ pub(super) async fn build(
         &ctx.user_id,
         &ctx.workspace,
         &ctx.conversation_id,
+        config.codebuddy_account_id.as_deref(),
         &deps.data_dir,
         deps.broadcaster.clone(),
     )
@@ -350,11 +351,36 @@ pub(super) async fn resolve_catalog_metadata(
     ))
 }
 
+/// Account a CodeBuddy spawn should run as.
+///
+/// The conversation's own binding wins; an unbound conversation (including
+/// every conversation created before bindings existed) follows the
+/// library-wide active account. A binding whose account was removed from the
+/// library also falls back to active, so the conversation keeps working after
+/// the user deletes the account.
+fn resolve_spawn_account(
+    accounts: &crate::codebuddy_accounts::CodeBuddyAccountStore,
+    bound_account_id: Option<&str>,
+    conversation_id: &str,
+) -> Option<crate::codebuddy_accounts::StoredAccount> {
+    let bound = bound_account_id.and_then(|id| accounts.get(id));
+    if bound_account_id.is_some() && bound.is_none() {
+        tracing::warn!(
+            conversation_id,
+            account_id = bound_account_id.unwrap_or_default(),
+            "CodeBuddy conversation is bound to an account missing from the library; \
+             falling back to the active account"
+        );
+    }
+    bound.or_else(|| accounts.active())
+}
+
 async fn resolve_agent_command_spec(
     meta: &aionui_api_types::AgentMetadata,
     user_id: &str,
     workspace: &str,
     conversation_id: &str,
+    codebuddy_account_id: Option<&str>,
     data_dir: &std::path::Path,
     broadcaster: Arc<dyn aionui_realtime::EventBroadcaster>,
 ) -> Result<CommandSpec, AgentError> {
@@ -398,13 +424,20 @@ async fn resolve_agent_command_spec(
     }));
 
     // CodeBuddy multi-account: the CLI gives `CODEBUDDY_AUTH_TOKEN` the highest
-    // storage priority, so injecting the active account's Bearer token is how a
+    // storage priority, so injecting a conversation's Bearer token is how a
     // session runs as a specific account without touching the global auth file.
     // `CODEBUDDY_CONFIG_DIR` keeps that account's sessions/settings separate.
     // Pushed last so it beats any manual value in the agent's own env list.
+    //
+    // A conversation pins its account (`extra.codebuddy_account_id`) when the
+    // user picks one; spawning then honours that choice instead of the
+    // library-wide active account, so switching accounts in another
+    // conversation cannot change what this one runs as. An unbound
+    // conversation — including every conversation created before the binding
+    // existed — keeps following the active account.
     if meta.backend.as_deref() == Some("codebuddy") {
         let accounts = crate::codebuddy_accounts::CodeBuddyAccountStore::new(data_dir);
-        if let Some(account) = accounts.active() {
+        if let Some(account) = resolve_spawn_account(&accounts, codebuddy_account_id, conversation_id) {
             // Renew an expiring credential before handing it to the CLI: the
             // injected custom token carries no refresh token of its own.
             let account = crate::codebuddy_accounts::ensure_fresh(&accounts, account).await;
@@ -677,6 +710,45 @@ mod tests {
     };
 
     const TEST_USER_ID: &str = "user-1";
+
+    #[test]
+    fn codebuddy_spawn_account_prefers_the_conversation_binding() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::codebuddy_accounts::CodeBuddyAccountStore::new(dir.path());
+        for (id, token) in [("uid-a", "token-a-1111"), ("uid-b", "token-b-2222")] {
+            store
+                .upsert(crate::codebuddy_accounts::StoredAccount {
+                    id: id.to_owned(),
+                    name: id.to_owned(),
+                    uid: id.to_owned(),
+                    access_token: token.to_owned(),
+                    refresh_token: None,
+                    domain: None,
+                    token_type: "Bearer".to_owned(),
+                    expires_at: None,
+                    refresh_expires_at: None,
+                    last_refresh: None,
+                    profile_dir: format!("/profiles/{id}"),
+                    source: "import".to_owned(),
+                    auto_switch_enabled: true,
+                    created_at: 0,
+                    last_used_at: 0,
+                })
+                .unwrap();
+        }
+        // The library default deliberately differs from the conversation's
+        // binding: spawn must follow the binding.
+        store.activate("uid-a").unwrap();
+
+        let bound = resolve_spawn_account(&store, Some("uid-b"), "conv-1").expect("bound account");
+        assert_eq!(bound.id, "uid-b");
+
+        let unbound = resolve_spawn_account(&store, None, "conv-1").expect("active account");
+        assert_eq!(unbound.id, "uid-a");
+
+        let removed = resolve_spawn_account(&store, Some("uid-gone"), "conv-1").expect("fallback account");
+        assert_eq!(removed.id, "uid-a", "a stale binding falls back to the active account");
+    }
 
     fn make_row(
         name: &str,
@@ -973,6 +1045,7 @@ mod tests {
             "user-acp",
             "/tmp/workspace",
             "conv-acp",
+            None,
             std::path::Path::new("/tmp"),
             Arc::new(BroadcastEventBus::new(16)),
         )
@@ -996,6 +1069,7 @@ mod tests {
             "user-acp",
             "/tmp/workspace",
             "conv-acp",
+            None,
             std::path::Path::new("/tmp"),
             Arc::new(BroadcastEventBus::new(16)),
         )
