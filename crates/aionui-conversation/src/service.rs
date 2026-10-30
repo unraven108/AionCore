@@ -4057,6 +4057,7 @@ impl ConversationService {
             stored_workspace,
             turn_id: turn_id.clone(),
             turn_claim,
+            user_msg_id: Some(user_msg_id.clone()),
         });
 
         info!(
@@ -4097,8 +4098,10 @@ impl ConversationService {
 
         let turn_id = Self::mint_turn_id();
         let turn_claim = self.runtime_state.try_claim_turn(&request.conversation_id, &turn_id)?;
+        let mut user_msg_id_for_turn = None;
         if request.persist_user_message {
             let user_msg_id = Self::mint_msg_id();
+            user_msg_id_for_turn = Some(user_msg_id.clone());
             let user_msg = aionui_db::models::MessageRow {
                 id: user_msg_id.clone(),
                 conversation_id: request.conversation_id.clone(),
@@ -4179,6 +4182,7 @@ impl ConversationService {
                 stored_workspace,
                 turn_id: turn_id.clone(),
                 turn_claim,
+                user_msg_id: user_msg_id_for_turn,
             })
             .await;
 

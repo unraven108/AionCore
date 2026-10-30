@@ -7143,6 +7143,126 @@ async fn codebuddy_auth_error_fails_over_to_the_next_account() {
 }
 
 #[tokio::test]
+async fn codebuddy_failover_replay_carries_recent_transcript() {
+    let (svc, _broadcaster, repo, _default_task_mgr) = make_service();
+    let temp = tempfile::tempdir().unwrap();
+    let store = Arc::new(CodeBuddyAccountStore::new(temp.path()));
+    let now = aionui_common::now_ms();
+    for (id, name, token) in [
+        ("uid-a", "Account A", "token-a-1111"),
+        ("uid-b", "Account B", "token-b-2222"),
+    ] {
+        store
+            .upsert(aionui_ai_agent::codebuddy_accounts::StoredAccount {
+                id: id.to_owned(),
+                name: name.to_owned(),
+                uid: id.to_owned(),
+                access_token: token.to_owned(),
+                refresh_token: Some("refresh-token".to_owned()),
+                domain: Some("www.codebuddy.ai".to_owned()),
+                token_type: "Bearer".to_owned(),
+                expires_at: Some(now + 86_400_000),
+                refresh_expires_at: Some(now + 864_000_000),
+                last_refresh: None,
+                profile_dir: String::new(),
+                source: "import".to_owned(),
+                auto_switch_enabled: true,
+                created_at: now,
+                last_used_at: 0,
+            })
+            .unwrap();
+    }
+    store.activate("uid-a").unwrap();
+    let svc = svc.with_codebuddy_accounts(store.clone());
+
+    let conv = svc
+        .create("user_1", make_create_req_with_backend("codebuddy"))
+        .await
+        .unwrap();
+
+    for (id, content, position, created_at) in [
+        ("prior-user", "Fix the build", "right", 1_000),
+        ("prior-assistant", "I will inspect Cargo.toml", "left", 2_000),
+    ] {
+        repo.insert_message(
+            "user_1",
+            &MessageRow {
+                id: id.into(),
+                conversation_id: conv.id.clone(),
+                msg_id: Some(id.into()),
+                r#type: "text".into(),
+                content: json!({ "content": content }).to_string(),
+                position: Some(position.into()),
+                status: Some("finish".into()),
+                hidden: false,
+                created_at,
+                backend_turn_id: None,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    let first = Arc::new(ScriptedAgent::new(
+        &conv.id,
+        vec![vec![AgentStreamEvent::Error(ErrorEventData {
+            message: "authentication required".into(),
+            code: Some(AgentErrorCode::UserAgentAuthRequired),
+            ownership: None,
+            detail: None,
+            workspace_path: None,
+            retryable: Some(false),
+            feedback_recommended: None,
+            resolution: None,
+        })]],
+    ));
+    let second = Arc::new(ScriptedAgent::new(
+        &conv.id,
+        vec![vec![
+            AgentStreamEvent::Text(TextEventData { content: "done".into() }),
+            AgentStreamEvent::Finish(FinishEventData::default()),
+        ]],
+    ));
+    let task_mgr = Arc::new(RebuildingScriptedTaskManager::new(vec![
+        AgentInstance::Mock(first),
+        AgentInstance::Mock(second.clone()),
+    ]));
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+
+    svc.send_message("user_1", &conv.id, make_send_req(), &task_mgr_dyn)
+        .await
+        .unwrap();
+    wait_for_turn_released(&svc, &conv.id).await;
+
+    let sent = second.sent_contents();
+    assert_eq!(sent.len(), 1);
+    assert!(
+        sent[0].contains("[Previous Conversation]"),
+        "preamble missing: {}",
+        sent[0]
+    );
+    assert!(
+        sent[0].contains("User: Fix the build"),
+        "prior user turn missing: {}",
+        sent[0]
+    );
+    assert!(
+        sent[0].contains("Assistant: I will inspect Cargo.toml"),
+        "prior assistant turn missing: {}",
+        sent[0]
+    );
+    assert!(sent[0].ends_with("Hello"), "current prompt must stay last: {}", sent[0]);
+
+    let messages = repo_messages_asc(&repo, &conv.id, 30).await;
+    assert!(
+        !messages
+            .iter()
+            .any(|message| message.content.contains("Previous Conversation")),
+        "the replay preamble must not be persisted as a message"
+    );
+}
+
+#[tokio::test]
 async fn auto_replay_rebuild_keeps_existing_acp_session_id_in_build_options() {
     let acp_session_repo = Arc::new(StubAcpSessionRepo::with_session_id("sess-existing"));
     let (svc, _broadcaster, _repo, _default_task_mgr) = make_service_with_resolver_and_acp_session_repo(

@@ -10,6 +10,7 @@ use tokio::sync::oneshot;
 use tracing::{debug, error, info, warn};
 
 use crate::agent_health_policy::{AgentHealthAction, AgentHealthPolicy};
+use crate::failover_replay;
 use crate::runtime_state::RuntimeLifecycleState;
 use crate::runtime_state::TurnClaim;
 use crate::service::{
@@ -28,6 +29,14 @@ fn acp_backend_from_build_options(options: &BuildTaskOptions) -> Option<&str> {
     }
 }
 
+/// Resume anchor currently carried by the turn's build options.
+fn acp_session_id_from_build_options(options: &BuildTaskOptions) -> Option<&str> {
+    match &options.context.kind {
+        AgentSessionKind::Acp(ctx) => ctx.session_id.as_deref(),
+        _ => None,
+    }
+}
+
 pub(crate) struct TurnStartInput {
     pub user_id: String,
     pub conversation: ConversationRow,
@@ -43,6 +52,10 @@ pub(crate) struct TurnStartInput {
     pub stored_workspace: String,
     pub turn_id: String,
     pub turn_claim: TurnClaim,
+    /// Persisted id of the user message that opened this turn. Excluded from
+    /// the failover replay preamble because the same text is sent as the
+    /// current prompt.
+    pub user_msg_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,14 +109,17 @@ impl ConversationTurnOrchestrator {
     }
 
     /// Switch away from a dead/exhausted CodeBuddy account and prepare the
-    /// rebuild. Returns the new account name when a switch happened.
+    /// rebuild. Returns the new account name plus an optional transcript
+    /// preamble: the next account starts a fresh ACP session, so the replay
+    /// must carry the visible history itself.
     async fn try_codebuddy_account_failover(
         &self,
         user_id: &str,
         conversation_id: &str,
+        user_msg_id: Option<&str>,
         build_options: &mut BuildTaskOptions,
         attempt: &TurnAttemptResult,
-    ) -> Option<String> {
+    ) -> Option<(String, Option<String>)> {
         let reason = should_failover_codebuddy(attempt.backend.as_deref(), &attempt.outcome)?;
         let store = self.service.codebuddy_accounts()?;
         let previous = store.active().map(|account| account.id);
@@ -119,14 +135,23 @@ impl ConversationTurnOrchestrator {
             .refresh_resume_anchor_for_replay(conversation_id, build_options)
             .await;
 
+        let context = failover_replay::build_replay_context(
+            self.service.conversation_repo().as_ref(),
+            user_id,
+            conversation_id,
+            user_msg_id,
+        )
+        .await;
+
         info!(
             conversation_id,
             reason = ?reason,
             from_account = previous.as_deref().unwrap_or("none"),
             to_account = %next.id,
+            history_carried = context.is_some(),
             "CodeBuddy account failover: switched account and replaying turn"
         );
-        Some(next.name)
+        Some((next.name, context))
     }
 
     async fn run_attempt(&self, input: TurnAttemptInput) -> Result<TurnAttemptResult, ConversationTurnResult> {
@@ -509,6 +534,9 @@ impl ConversationTurnOrchestrator {
         };
         let mut replayed = false;
         let mut failover_attempted = false;
+        // Transcript injected once into the first attempt after an account
+        // switch; taken by the loop so later retries never duplicate it.
+        let mut replay_context: Option<String> = None;
         let superseding_tips = SupersedingTipTotals::default();
         let mut replay_started_at = None;
         let mut final_error_message;
@@ -518,6 +546,10 @@ impl ConversationTurnOrchestrator {
 
         let final_failed = loop {
             let attempt_number = if replayed { 2 } else { 1 };
+            let mut send = initial_send.clone();
+            if let Some(prefix) = replay_context.take() {
+                send.content = format!("{prefix}\n\n{}", send.content);
+            }
             let attempt_result = match self
                 .run_attempt(TurnAttemptInput {
                     conv_id: conv_id.clone(),
@@ -525,7 +557,7 @@ impl ConversationTurnOrchestrator {
                     user_id: input.user_id.clone(),
                     build_options: input.build_options.clone(),
                     stored_workspace: input.stored_workspace.clone(),
-                    send: initial_send.clone(),
+                    send,
                     msg_id: first_turn_msg_id.clone(),
                     allowed_skill_names: allowed_skill_names.clone(),
                     required_runtime_mode: input.required_runtime_mode.clone(),
@@ -552,11 +584,18 @@ impl ConversationTurnOrchestrator {
             // clean-finish break below: a quota refusal is a WarningTip, so its
             // terminal is `Finish`, not `Error`.
             if !failover_attempted
-                && let Some(account_name) = self
-                    .try_codebuddy_account_failover(&user_id, &conv_id, &mut input.build_options, &attempt_result)
+                && let Some((account_name, context)) = self
+                    .try_codebuddy_account_failover(
+                        &user_id,
+                        &conv_id,
+                        input.user_msg_id.as_deref(),
+                        &mut input.build_options,
+                        &attempt_result,
+                    )
                     .await
             {
                 failover_attempted = true;
+                replay_context = context;
                 info!(
                     conversation_id = %conv_id,
                     turn_id = %turn_id,
@@ -636,6 +675,21 @@ impl ConversationTurnOrchestrator {
                     self.service
                         .refresh_resume_anchor_for_replay(&conv_id, &mut input.build_options)
                         .await;
+                    // CodeBuddy only: when the replay has no anchor it opens a
+                    // fresh session, so the visible history must travel with it.
+                    // A still-present anchor resumes the same session and must
+                    // not repeat the transcript.
+                    if acp_session_id_from_build_options(&input.build_options).is_none()
+                        && attempt_result.backend.as_deref() == Some("codebuddy")
+                    {
+                        replay_context = failover_replay::build_replay_context(
+                            self.service.conversation_repo().as_ref(),
+                            &input.user_id,
+                            &conv_id,
+                            input.user_msg_id.as_deref(),
+                        )
+                        .await;
+                    }
                     replayed = true;
                     continue;
                 }
