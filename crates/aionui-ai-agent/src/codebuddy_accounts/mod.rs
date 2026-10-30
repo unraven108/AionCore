@@ -239,12 +239,23 @@ impl CodeBuddyAccountStore {
     /// renew one; prefers the least recently used so retries spread across the
     /// library instead of hammering one account.
     pub fn next_usable_account(&self, now: i64) -> Option<StoredAccount> {
+        let active_id = self.read().active_id;
+        self.next_usable_account_excluding(active_id.as_deref(), now)
+    }
+
+    /// Next account to use when the account a conversation runs as fails.
+    ///
+    /// Same preference order as [`Self::next_usable_account`], but the excluded
+    /// account is the one the conversation is actually bound to — which may not
+    /// be the library-wide active one. Failover uses this instead of activating
+    /// an account globally so one conversation's dead credential cannot move
+    /// every other conversation onto a different account.
+    pub fn next_usable_account_excluding(&self, current_id: Option<&str>, now: i64) -> Option<StoredAccount> {
         let file = self.read();
-        let active_id = file.active_id.as_deref();
         let mut candidates: Vec<StoredAccount> = file
             .accounts
             .into_iter()
-            .filter(|account| Some(account.id.as_str()) != active_id)
+            .filter(|account| Some(account.id.as_str()) != current_id)
             .filter(|account| usable_for_failover(account, now))
             .collect();
         candidates.sort_by(|left, right| {
@@ -253,37 +264,6 @@ impl CodeBuddyAccountStore {
                 .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
         });
         candidates.into_iter().next()
-    }
-
-    /// Activate the account chosen by [`Self::next_usable_account`].
-    ///
-    /// Returns the newly active account, or `None` when there is no other
-    /// usable account or the library cannot be written.
-    pub fn activate_next_usable(&self) -> Option<StoredAccount> {
-        let now = aionui_common::now_ms();
-        let mut file = self.read();
-        let active_id = file.active_id.clone();
-        let next_id = {
-            let mut candidates: Vec<&StoredAccount> = file
-                .accounts
-                .iter()
-                .filter(|account| Some(&account.id) != active_id.as_ref())
-                .filter(|account| usable_for_failover(account, now))
-                .collect();
-            candidates.sort_by(|left, right| {
-                left.last_used_at
-                    .cmp(&right.last_used_at)
-                    .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
-            });
-            candidates.first().map(|account| account.id.clone())?
-        };
-
-        file.active_id = Some(next_id.clone());
-        let next = file.accounts.iter_mut().find(|account| account.id == next_id)?;
-        next.last_used_at = now;
-        let activated = next.clone();
-        self.write(&file).ok()?;
-        Some(activated)
     }
 
     pub fn remove(&self, id: &str) -> std::io::Result<bool> {
@@ -531,23 +511,61 @@ mod tests {
     }
 
     #[test]
-    fn activate_next_usable_persists_the_switch() {
+    fn next_usable_account_excluding_skips_the_conversation_bound_account() {
         let (_dir, store) = temp_store();
+        let now = aionui_common::now_ms();
+        store.upsert(account("uid-a", "token-aaaaaa-1111")).unwrap();
+        store.upsert(account("uid-b", "token-bbbbbb-2222")).unwrap();
+        store.upsert(account("uid-c", "token-cccccc-3333")).unwrap();
+        // The library-wide active account is deliberately not the one the
+        // conversation is bound to: failover must follow the conversation.
+        store.activate("uid-a").unwrap();
+
+        let next = store
+            .next_usable_account_excluding(Some("uid-b"), now)
+            .expect("another account");
+        assert_ne!(next.id, "uid-b", "the bound account must not be retried");
+    }
+
+    #[test]
+    fn next_usable_account_excluding_leaves_the_active_account_alone() {
+        let (_dir, store) = temp_store();
+        let now = aionui_common::now_ms();
         store.upsert(account("uid-a", "token-aaaaaa-1111")).unwrap();
         store.upsert(account("uid-b", "token-bbbbbb-2222")).unwrap();
         store.activate("uid-a").unwrap();
 
-        let activated = store.activate_next_usable().expect("next account");
-        assert_eq!(activated.id, "uid-b");
-        assert_eq!(store.active().map(|account| account.id), Some("uid-b".to_owned()));
-        assert!(activated.last_used_at > 0);
+        let next = store
+            .next_usable_account_excluding(Some("uid-a"), now)
+            .expect("next account");
+        assert_eq!(next.id, "uid-b");
+        assert_eq!(
+            store.active().map(|account| account.id),
+            Some("uid-a".to_owned()),
+            "a per-conversation failover must not move the global default"
+        );
     }
 
     #[test]
-    fn activate_next_usable_returns_none_without_an_alternative() {
+    fn next_usable_account_excluding_returns_none_when_every_alternative_is_excluded() {
+        let (_dir, store) = temp_store();
+        let now = aionui_common::now_ms();
+        store.upsert(account("uid-a", "token-aaaaaa-1111")).unwrap();
+        store.upsert(account("uid-b", "token-bbbbbb-2222")).unwrap();
+        store.activate("uid-a").unwrap();
+        assert!(store.set_auto_switch_enabled("uid-b", false).unwrap());
+
+        assert!(store.next_usable_account_excluding(Some("uid-a"), now).is_none());
+        assert_eq!(store.active().map(|account| account.id), Some("uid-a".to_owned()));
+    }
+
+    #[test]
+    fn get_returns_a_binding_only_while_the_account_exists() {
         let (_dir, store) = temp_store();
         store.upsert(account("uid-a", "token-aaaaaa-1111")).unwrap();
-        assert!(store.activate_next_usable().is_none());
+
+        assert_eq!(store.get("uid-a").map(|account| account.id), Some("uid-a".to_owned()));
+        assert!(store.get("uid-missing").is_none());
     }
 
     #[test]
@@ -562,22 +580,6 @@ mod tests {
 
         let next = store.next_usable_account(now).expect("next account");
         assert_eq!(next.id, "uid-c", "excluded account must be skipped");
-    }
-
-    #[test]
-    fn activate_next_usable_returns_none_when_every_alternative_is_excluded() {
-        let (_dir, store) = temp_store();
-        store.upsert(account("uid-a", "token-aaaaaa-1111")).unwrap();
-        store.upsert(account("uid-b", "token-bbbbbb-2222")).unwrap();
-        store.activate("uid-a").unwrap();
-        assert!(store.set_auto_switch_enabled("uid-b", false).unwrap());
-
-        assert!(store.activate_next_usable().is_none());
-        assert_eq!(
-            store.active().map(|account| account.id),
-            Some("uid-a".to_owned()),
-            "the active account must stay put when failover has no candidate"
-        );
     }
 
     #[test]

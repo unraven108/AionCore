@@ -7123,8 +7123,20 @@ async fn codebuddy_auth_error_fails_over_to_the_next_account() {
     assert_eq!(task_mgr.kill_count(), 1);
     assert_eq!(
         store.active().map(|account| account.id),
-        Some("uid-b".to_owned()),
-        "the failed account must be replaced by the next usable one"
+        Some("uid-a".to_owned()),
+        "failover is per-conversation: the library-wide active account must stay put"
+    );
+    let row = svc
+        .conversation_repo()
+        .get("user_1", &conv.id)
+        .await
+        .unwrap()
+        .expect("conversation row");
+    let extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap();
+    assert_eq!(
+        extra.get("codebuddy_account_id").and_then(|value| value.as_str()),
+        Some("uid-b"),
+        "the failed account must be replaced by the next usable one on this conversation"
     );
     assert_eq!(first.sent_contents(), vec!["Hello"]);
     assert_eq!(second.sent_contents(), vec!["Hello"]);

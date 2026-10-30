@@ -37,6 +37,22 @@ fn acp_session_id_from_build_options(options: &BuildTaskOptions) -> Option<&str>
     }
 }
 
+/// CodeBuddy account the turn is configured to run as, when the conversation
+/// pinned one. `None` = follow the library-wide active account.
+fn codebuddy_account_id_from_build_options(options: &BuildTaskOptions) -> Option<String> {
+    match &options.context.kind {
+        AgentSessionKind::Acp(ctx) => ctx.config.codebuddy_account_id.clone(),
+        _ => None,
+    }
+}
+
+/// Bind the retry build to `account_id` so it spawns as that account.
+fn set_codebuddy_account_id(options: &mut BuildTaskOptions, account_id: &str) {
+    if let AgentSessionKind::Acp(ctx) = &mut options.context.kind {
+        ctx.config.codebuddy_account_id = Some(account_id.to_owned());
+    }
+}
+
 pub(crate) struct TurnStartInput {
     pub user_id: String,
     pub conversation: ConversationRow,
@@ -112,6 +128,10 @@ impl ConversationTurnOrchestrator {
     /// rebuild. Returns the new account name plus an optional transcript
     /// preamble: the next account starts a fresh ACP session, so the replay
     /// must carry the visible history itself.
+    ///
+    /// The switch is scoped to this conversation: it pins the next account on
+    /// the conversation's `extra` and leaves the library-wide active account
+    /// untouched, so other conversations keep running as their own accounts.
     async fn try_codebuddy_account_failover(
         &self,
         user_id: &str,
@@ -122,8 +142,40 @@ impl ConversationTurnOrchestrator {
     ) -> Option<(String, Option<String>)> {
         let reason = should_failover_codebuddy(attempt.backend.as_deref(), &attempt.outcome)?;
         let store = self.service.codebuddy_accounts()?;
-        let previous = store.active().map(|account| account.id);
-        let next = store.activate_next_usable()?;
+        // Follow the account THIS conversation runs as, which is not
+        // necessarily the library-wide active one: an explicit binding wins,
+        // otherwise the conversation has been following the active account.
+        let previous = codebuddy_account_id_from_build_options(build_options)
+            .or_else(|| store.active().map(|account| account.id));
+        let next = store.next_usable_account_excluding(previous.as_deref(), now_ms())?;
+
+        // Bind the conversation, not the library. Moving the global active
+        // account here would drag every other conversation (bound or not) onto
+        // this one's replacement the next time it respawns.
+        set_codebuddy_account_id(build_options, &next.id);
+        match self
+            .service
+            .update_extra(
+                user_id,
+                conversation_id,
+                serde_json::json!({ "codebuddy_account_id": &next.id }),
+            )
+            .await
+        {
+            Ok(()) => {
+                // The conversation row changed; the open page refetches on this
+                // event, which is what updates the header's account pill.
+                self.service
+                    .broadcast_list_changed(user_id, conversation_id, "updated", None);
+            }
+            Err(error) => warn!(
+                conversation_id,
+                error = %error,
+                "Failed to persist the CodeBuddy account binding after failover; \
+                 the retry still runs as the new account, but later rebuilds fall back \
+                 to the previous binding"
+            ),
+        }
 
         // The account is injected into the CLI environment at spawn time, so
         // the running process must be recycled before the retry. The old
@@ -579,10 +631,11 @@ impl ConversationTurnOrchestrator {
             auth_failure = terminal_is_auth_failure(&attempt_result.outcome);
 
             // A CodeBuddy turn can fail before producing anything because the
-            // active account is dead or out of quota. Switch to the next usable
-            // account and replay the same prompt once. This must run BEFORE the
-            // clean-finish break below: a quota refusal is a WarningTip, so its
-            // terminal is `Finish`, not `Error`.
+            // account this conversation runs as is dead or out of quota. Switch
+            // this conversation to the next usable account and replay the same
+            // prompt once. This must run BEFORE the clean-finish break below: a
+            // quota refusal is a WarningTip, so its terminal is `Finish`, not
+            // `Error`.
             if !failover_attempted
                 && let Some((account_name, context)) = self
                     .try_codebuddy_account_failover(
