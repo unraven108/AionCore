@@ -13,7 +13,8 @@ aionui-project.workspace = true
 aionui-runtime.workspace = true
 axum.workspace = true
 tokio.workspace = true
-reqwest.workspace = true
+reqwest = { workspace = true, features = ["stream"] }
+futures-util.workspace = true
 which.workspace = true
 calamine.workspace = true
 sha1.workspace = true
@@ -27,5 +28,6 @@ async-trait.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 rust_xlsxwriter.workspace = true
+futures-util.workspace = true
 tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
 aionui-db.workspace = true

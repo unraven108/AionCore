@@ -17,7 +17,7 @@ use aionui_common::ApiError;
 use aionui_file::{FileError, path_safety::validate_path_with_extra_root};
 
 use crate::error::OfficeError;
-use crate::proxy::ProxyError;
+use crate::proxy::{ProxyError, RenderState};
 use crate::state::OfficeRouterState;
 use crate::types::DocType;
 
@@ -30,6 +30,7 @@ impl From<OfficeError> for ApiError {
             OfficeError::PortTimeout(path) => {
                 ApiError::Internal(format!("preview service readiness timeout for {path}"))
             }
+            OfficeError::RenderFailed(msg) => ApiError::Internal(format!("preview render failed: {msg}")),
             OfficeError::Io(e) => ApiError::Internal(format!("IO error: {e}")),
             OfficeError::Snapshot(msg) => ApiError::Internal(format!("snapshot error: {msg}")),
             OfficeError::Json(e) => ApiError::Internal(format!("JSON error: {e}")),
@@ -185,8 +186,17 @@ async fn start_preview(
 
     let resp = match result {
         Ok(port) => {
-            let url = format!("/api/{}/{}", doc_type.proxy_prefix(), port);
-            PreviewUrlResponse { url, error: None }
+            if document_is_rendered(&state, user_id, port, &validated_path, doc_type).await {
+                PreviewUrlResponse {
+                    url: format!("/api/{}/{}", doc_type.proxy_prefix(), port),
+                    error: None,
+                }
+            } else {
+                PreviewUrlResponse {
+                    url: String::new(),
+                    error: Some("OFFICECLI_RENDER_FAILED".to_owned()),
+                }
+            }
         }
         Err(e) => PreviewUrlResponse {
             url: String::new(),
@@ -195,6 +205,59 @@ async fn start_preview(
     };
 
     Ok(Json(ApiResponse::ok(resp)))
+}
+
+/// How long the recovery re-render may take before the preview is declared dead.
+///
+/// This is a render budget for one document, not a network one, so it sits below
+/// [`SWITCH_TIMEOUT`] — a stuck second attempt should fail while the user is still
+/// looking at the spinner, not a minute later.
+const RENDER_RECOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Confirm the watch server is showing the document, recovering once if it is not.
+///
+/// officecli serves a "waiting for the first update" placeholder when its first
+/// render cannot read the file — the common cause being its own resident still
+/// holding the document, which is exactly the state right after an agent saves
+/// one. It never retries by itself (only its own edits re-render), so without this
+/// the tab stays blank for as long as it is open and nothing reports a problem.
+///
+/// A same-file `/api/switch` is officecli's documented force-refresh: it re-reads
+/// from disk and broadcasts `doc-switched`, which makes the page fetch the
+/// re-rendered HTML. If the file is still not readable afterwards, the session is
+/// torn down and the caller reports `OFFICECLI_RENDER_FAILED` — better than a
+/// blank frame the user cannot distinguish from a slow load.
+async fn document_is_rendered(
+    state: &OfficeRouterState,
+    user_id: &str,
+    port: u16,
+    file_path: &str,
+    doc_type: DocType,
+) -> bool {
+    if state.proxy_service.render_state(port).await != RenderState::Placeholder {
+        return true;
+    }
+
+    tracing::warn!(port, doc_type = %doc_type, "preview started without rendering the document; retrying");
+
+    if let Err(code) = state
+        .proxy_service
+        .force_reload(port, file_path, RENDER_RECOVERY_TIMEOUT)
+        .await
+    {
+        tracing::warn!(port, code, "recovery re-render was rejected");
+    }
+
+    if state.proxy_service.render_state(port).await != RenderState::Placeholder {
+        return true;
+    }
+
+    // Leaving the process behind would keep the placeholder servable on a port the
+    // frontend no longer references, and would block the next start with a stale
+    // session for the same file.
+    state.watch_manager.stop_for_user(user_id, file_path, doc_type).await;
+    tracing::warn!(port, doc_type = %doc_type, "preview could not render the document");
+    false
 }
 
 /// How long to wait on officecli's `/api/switch`. The switch re-renders the
@@ -390,6 +453,7 @@ fn preview_error_code(error: &OfficeError) -> &'static str {
         OfficeError::OfficecliNotFound => "OFFICECLI_NOT_FOUND",
         OfficeError::InstallFailed(_) => "OFFICECLI_INSTALL_FAILED",
         OfficeError::PortTimeout(_) => "OFFICECLI_PORT_TIMEOUT",
+        OfficeError::RenderFailed(_) => "OFFICECLI_RENDER_FAILED",
         OfficeError::StartFailed(_)
         | OfficeError::Io(_)
         | OfficeError::Snapshot(_)
@@ -423,6 +487,14 @@ async fn office_watch_proxy(
         .filter_map(|(k, v)| v.to_str().ok().map(|val| (k.as_str().to_owned(), val.to_owned())))
         .collect();
 
+    if accepts_event_stream(&headers) {
+        let stream = state
+            .proxy_service
+            .forward_watch_event_stream_for_user(&user.id, params.port, path, &request_headers)
+            .await?;
+        return Ok(stream_response(stream));
+    }
+
     let proxy_resp = state
         .proxy_service
         .forward_watch_for_user(&user.id, params.port, path, &request_headers)
@@ -440,6 +512,33 @@ async fn office_watch_proxy(
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()))
 }
 
+/// Whether the caller is opening a long-lived event stream rather than a page.
+///
+/// `EventSource` always sends this `Accept`, and the watch page's only use for it
+/// is the `/events` feed. Routing it to the buffered path would park the request
+/// on the proxy's 30s budget and then fail, so the page would sit in a reconnect
+/// loop.
+fn accepts_event_stream(headers: &HeaderMap) -> bool {
+    headers
+        .get(axum::http::header::ACCEPT)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|accept| accept.contains("text/event-stream"))
+}
+
+fn stream_response(stream: crate::proxy::ProxyStreamResponse) -> Response {
+    let status = StatusCode::from_u16(stream.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let mut response = axum::response::Response::builder().status(status);
+
+    for (key, value) in &stream.headers {
+        response = response.header(key.as_str(), value.as_str());
+    }
+
+    let body = axum::body::Body::from_stream(stream.body);
+    response
+        .body(body)
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
 async fn proxy_forward(
     state: OfficeRouterState,
     user_id: &str,
@@ -452,6 +551,14 @@ async fn proxy_forward(
         .iter()
         .filter_map(|(k, v)| v.to_str().ok().map(|val| (k.as_str().to_owned(), val.to_owned())))
         .collect();
+
+    if accepts_event_stream(headers) {
+        let stream = state
+            .proxy_service
+            .forward_event_stream_for_user(user_id, port, path, doc_type, &request_headers)
+            .await?;
+        return Ok(stream_response(stream));
+    }
 
     let proxy_resp = state
         .proxy_service
@@ -483,7 +590,7 @@ mod tests {
     use crate::types::DocType;
     use crate::watch_manager::{OfficecliWatchManager, ProcessHandle, ProcessSpawner};
 
-    use super::{ApiError, file_error_to_api_error, office_proxy_routes, office_routes};
+    use super::{ApiError, file_error_to_api_error, office_proxy_routes, office_routes, preview_error_code};
 
     #[tokio::test]
     async fn office_routes_builds_without_panic() {
@@ -532,6 +639,22 @@ mod tests {
     fn conversion_error_maps_to_internal() {
         let err = ApiError::from(OfficeError::Conversion("bad format".into()));
         assert!(matches!(err, ApiError::Internal(msg) if msg.contains("bad format")));
+    }
+
+    #[test]
+    fn render_failed_maps_to_internal() {
+        let err = ApiError::from(OfficeError::RenderFailed("file is locked".into()));
+        assert!(matches!(err, ApiError::Internal(msg) if msg.contains("file is locked")));
+    }
+
+    // The frontend keys its copy and its retry affordance on this code, so it must
+    // not collapse into the generic start failure.
+    #[test]
+    fn render_failure_has_its_own_preview_code() {
+        assert_eq!(
+            preview_error_code(&OfficeError::RenderFailed("file is locked".into())),
+            "OFFICECLI_RENDER_FAILED"
+        );
     }
 
     #[test]

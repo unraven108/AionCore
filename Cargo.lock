@@ -761,6 +761,7 @@ dependencies = [
  "axum",
  "calamine",
  "dashmap",
+ "futures-util",
  "reqwest",
  "rust_xlsxwriter",
  "serde",

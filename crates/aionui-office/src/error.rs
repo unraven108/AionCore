@@ -12,6 +12,15 @@ pub enum OfficeError {
     #[error("port readiness timeout for {0}")]
     PortTimeout(String),
 
+    /// The preview server came up but never rendered the document.
+    ///
+    /// officecli serves a placeholder page when its first render cannot read the
+    /// file (typically because another process still holds it); it only re-renders
+    /// on its own edits, so the tab would stay blank forever. Carries the reason
+    /// for the server log — the client only ever sees the code.
+    #[error("preview render failed: {0}")]
+    RenderFailed(String),
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
@@ -42,6 +51,10 @@ mod tests {
         assert_eq!(
             OfficeError::PortTimeout("/a.docx".into()).to_string(),
             "port readiness timeout for /a.docx"
+        );
+        assert_eq!(
+            OfficeError::RenderFailed("file is locked".into()).to_string(),
+            "preview render failed: file is locked"
         );
         assert_eq!(
             OfficeError::Conversion("bad data".into()).to_string(),

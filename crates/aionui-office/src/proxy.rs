@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures_util::StreamExt;
 use reqwest::header::{CONTENT_TYPE, HOST, HeaderMap, HeaderName, HeaderValue};
 
 use crate::types::DocType;
@@ -30,12 +31,42 @@ var _ps=history.pushState.bind(history),_rs=history.replaceState.bind(history);
 history.pushState=function(s,t,u){_ps(s,t,u?rw(u):u);};history.replaceState=function(s,t,u){_rs(s,t,u?rw(u):u);};
 try{Object.defineProperty(location,'href',{set:function(v){_a(rw(v));},configurable:true});}catch(e){}
 document.addEventListener('click',function(e){var t=e.target;while(t&&t.tagName!=='A')t=t.parentElement;if(t&&t.tagName==='A'){var h=t.getAttribute('href');if(h&&(h[0]==='/'&&h[1]!=='/'&&!h.startsWith(b))){e.preventDefault();_a(b+h);}}},true);
+/* Request-scoped URLs need the same treatment, and EventSource matters most:
+   the watch page opens its update stream at the root-absolute '/events', which
+   without rewriting resolves against the app origin and 404s — the preview then
+   never receives a single update and stays on whatever it painted first. */
+var _ES=window.EventSource;
+if(_ES){var ES=function(u,c){return new _ES(rw(u),c);};ES.prototype=_ES.prototype;ES.CONNECTING=_ES.CONNECTING;ES.OPEN=_ES.OPEN;ES.CLOSED=_ES.CLOSED;window.EventSource=ES;}
+var _fe=window.fetch;
+if(_fe){window.fetch=function(i,o){var u=i;if(typeof i==='string'){u=rw(i);}else if(typeof Request!=='undefined'&&i instanceof Request){u=new Request(rw(i.url),i);}return _fe(u,o);};}
+var _xo=XMLHttpRequest.prototype.open;
+XMLHttpRequest.prototype.open=function(m,u){var a=[].slice.call(arguments);if(typeof u==='string'){a[1]=rw(u);}return _xo.apply(this,a);};
 })('PROXY_BASE_PLACEHOLDER');
 </script>"#;
+
+/// Markers officecli's watch page renders when its *first* render failed.
+///
+/// The page then waits for a document update to replace it, and officecli only
+/// re-renders on its own edits (external ones are explicitly not detected), so
+/// nothing ever replaces it. Both markers are required: a real document could
+/// plausibly contain the first sentence, but not the pair, so this cannot turn
+/// "the document happens to say this" into a spurious failure. If officecli ever
+/// rewords the page the check degrades to "assume rendered" — the old behaviour —
+/// rather than to a false error.
+const WATCH_PLACEHOLDER_MARKERS: [&str; 2] = [
+    "Waiting for first update",
+    "Run an officecli command to see the preview",
+];
 
 pub struct ProxyService {
     watch_manager: Arc<OfficecliWatchManager>,
     client: reqwest::Client,
+    /// Client for streaming responses (the watcher's `/events` feed).
+    ///
+    /// `client`'s whole-response timeout would kill an endless SSE body after
+    /// 30s, so streams get their own client: no total timeout, only a bound on
+    /// connecting.
+    stream_client: reqwest::Client,
 }
 
 #[derive(Debug)]
@@ -43,6 +74,37 @@ pub struct ProxyResponse {
     pub status: u16,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
+}
+
+/// A proxied response whose body is still arriving.
+pub struct ProxyStreamResponse {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub body: futures_util::stream::BoxStream<'static, Result<axum::body::Bytes, std::io::Error>>,
+}
+
+// The body is a stream, which is not `Debug`; the status and headers are what a
+// caller can usefully print.
+impl std::fmt::Debug for ProxyStreamResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProxyStreamResponse")
+            .field("status", &self.status)
+            .field("headers", &self.headers)
+            .field("body", &"<stream>")
+            .finish()
+    }
+}
+
+/// What the watch page currently shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenderState {
+    /// The document itself.
+    Rendered,
+    /// officecli's "waiting for the first update" page: the first render failed
+    /// and nothing will retry it.
+    Placeholder,
+    /// The page could not be read; nothing can be concluded from that.
+    Unknown,
 }
 
 impl ProxyService {
@@ -53,7 +115,17 @@ impl ProxyService {
             .build()
             .expect("failed to build proxy HTTP client");
 
-        Self { watch_manager, client }
+        let stream_client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("failed to build streaming proxy HTTP client");
+
+        Self {
+            watch_manager,
+            client,
+            stream_client,
+        }
     }
 
     /// Tell the watch server on `port` to re-render `absolute_path`, by re-issuing
@@ -169,6 +241,120 @@ impl ProxyService {
         self.forward_inner(port, path, &proxy_base, request_headers).await
     }
 
+    /// Ask the watch server on `port` what it is currently showing.
+    ///
+    /// Used right after a preview starts: officecli answers `GET /` from its cache,
+    /// so a placeholder page here means the first render failed and nothing will
+    /// retry it. `Unknown` (unreachable, unreadable body) deliberately does not
+    /// count as a failure — the caller only acts on `Placeholder`.
+    pub async fn render_state(&self, port: u16) -> RenderState {
+        let url = build_target_url(port, "/");
+        let response = match self.client.get(&url).send().await {
+            Ok(response) => response,
+            Err(error) => {
+                tracing::warn!(port, %error, "could not read watch page state");
+                return RenderState::Unknown;
+            }
+        };
+
+        if !response.status().is_success() {
+            tracing::warn!(
+                port,
+                status = response.status().as_u16(),
+                "watch page returned an error"
+            );
+            return RenderState::Unknown;
+        }
+
+        match response.text().await {
+            Ok(body) if WATCH_PLACEHOLDER_MARKERS.iter().all(|marker| body.contains(marker)) => {
+                RenderState::Placeholder
+            }
+            Ok(_) => RenderState::Rendered,
+            Err(error) => {
+                tracing::warn!(port, %error, "could not read watch page body");
+                RenderState::Unknown
+            }
+        }
+    }
+
+    /// Proxy a response whose body keeps arriving — the watcher's `/events` feed.
+    ///
+    /// The buffered [`forward`](Self::forward) path cannot carry this: it waits for
+    /// a complete body with a 30s budget, so an SSE stream would either time out or
+    /// arrive as one late lump, and the page would connect, hang, and reconnect
+    /// forever. Nothing is rewritten here — event streams carry no HTML.
+    pub async fn forward_event_stream_for_user(
+        &self,
+        user_id: &str,
+        port: u16,
+        path: &str,
+        doc_type: DocType,
+        request_headers: &[(String, String)],
+    ) -> Result<ProxyStreamResponse, ProxyError> {
+        if !self.watch_manager.is_active_port_for_user(user_id, port, doc_type) {
+            return Err(ProxyError::PortNotActive(port));
+        }
+        let proxy_base = format!("/api/{}/{}", doc_type.proxy_prefix(), port);
+        self.forward_stream_inner(port, path, &proxy_base, request_headers)
+            .await
+    }
+
+    /// Streaming variant of [`forward_watch`](Self::forward_watch): the
+    /// office-watch proxy serves both Word and Excel sessions, so the port check
+    /// accepts either.
+    pub async fn forward_watch_event_stream_for_user(
+        &self,
+        user_id: &str,
+        port: u16,
+        path: &str,
+        request_headers: &[(String, String)],
+    ) -> Result<ProxyStreamResponse, ProxyError> {
+        if !self.watch_manager.is_active_watch_port_for_user(user_id, port) {
+            return Err(ProxyError::PortNotActive(port));
+        }
+        let proxy_base = format!("/api/office-watch-proxy/{port}");
+        self.forward_stream_inner(port, path, &proxy_base, request_headers)
+            .await
+    }
+
+    async fn forward_stream_inner(
+        &self,
+        port: u16,
+        path: &str,
+        proxy_base: &str,
+        request_headers: &[(String, String)],
+    ) -> Result<ProxyStreamResponse, ProxyError> {
+        let target_url = build_target_url(port, path);
+        let req_headers = build_upstream_headers(port, request_headers);
+
+        let resp = self
+            .stream_client
+            .get(&target_url)
+            .headers(req_headers)
+            .send()
+            .await
+            .map_err(|e| {
+                if e.is_timeout() {
+                    ProxyError::Timeout
+                } else if e.is_connect() {
+                    ProxyError::ConnectionFailed(e.to_string())
+                } else {
+                    ProxyError::RequestFailed(e.to_string())
+                }
+            })?;
+
+        let status = resp.status().as_u16();
+        let headers = collect_out_headers(resp.headers(), false, port, proxy_base);
+
+        let body = resp
+            .bytes_stream()
+            .map(|chunk| chunk.map_err(std::io::Error::other))
+            .boxed();
+
+        Ok(ProxyStreamResponse { status, headers, body })
+    }
+
     async fn forward_inner(
         &self,
         port: u16,
@@ -177,26 +363,7 @@ impl ProxyService {
         request_headers: &[(String, String)],
     ) -> Result<ProxyResponse, ProxyError> {
         let target_url = build_target_url(port, path);
-
-        let mut req_headers = HeaderMap::new();
-        req_headers.insert(
-            HOST,
-            HeaderValue::from_str(&format!("127.0.0.1:{port}"))
-                .unwrap_or_else(|_| HeaderValue::from_static("127.0.0.1")),
-        );
-
-        for (key, value) in request_headers {
-            let lower = key.to_lowercase();
-            if is_hop_by_hop(&lower) {
-                continue;
-            }
-            if lower == "host" {
-                continue;
-            }
-            if let (Ok(name), Ok(val)) = (HeaderName::from_bytes(lower.as_bytes()), HeaderValue::from_str(value)) {
-                req_headers.insert(name, val);
-            }
-        }
+        let req_headers = build_upstream_headers(port, request_headers);
 
         let resp = self
             .client
@@ -221,35 +388,9 @@ impl ProxyService {
             .await
             .map_err(|e| ProxyError::RequestFailed(format!("failed to read response body: {e}")))?;
 
-        let mut out_headers = Vec::new();
         let is_html = is_html_content_type(&resp_headers);
+        let out_headers = collect_out_headers(&resp_headers, is_html, port, proxy_base);
         let mut body_bytes = body.to_vec();
-
-        for (name, value) in resp_headers.iter() {
-            let name_str = name.as_str().to_lowercase();
-
-            if is_hop_by_hop(&name_str) {
-                continue;
-            }
-
-            if name_str == "location"
-                && let Ok(loc) = value.to_str()
-            {
-                let rewritten = rewrite_location(loc, port, proxy_base);
-                out_headers.push(("location".to_owned(), rewritten));
-                continue;
-            }
-
-            if is_html && name_str == "content-length" {
-                continue;
-            }
-
-            if let Ok(val_str) = value.to_str() {
-                out_headers.push((name_str, val_str.to_owned()));
-            }
-        }
-
-        out_headers.push(("x-frame-options".to_owned(), "SAMEORIGIN".to_owned()));
 
         if is_html {
             body_bytes = inject_navigation_guard(&body_bytes, proxy_base);
@@ -287,8 +428,65 @@ fn build_target_url(port: u16, path: &str) -> String {
     format!("http://127.0.0.1:{port}{normalized}")
 }
 
+/// Copy the caller's headers upstream, minus the ones that must not travel: the
+/// connection-scoped set, and `Host`, which has to name the watch server.
+fn build_upstream_headers(port: u16, request_headers: &[(String, String)]) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        HOST,
+        HeaderValue::from_str(&format!("127.0.0.1:{port}")).unwrap_or_else(|_| HeaderValue::from_static("127.0.0.1")),
+    );
+
+    for (key, value) in request_headers {
+        let lower = key.to_lowercase();
+        if is_hop_by_hop(&lower) || lower == "host" {
+            continue;
+        }
+        if let (Ok(name), Ok(val)) = (HeaderName::from_bytes(lower.as_bytes()), HeaderValue::from_str(value)) {
+            headers.insert(name, val);
+        }
+    }
+
+    headers
+}
+
 fn is_hop_by_hop(header: &str) -> bool {
     HOP_BY_HOP_HEADERS.contains(&header)
+}
+
+/// Map upstream headers onto the response we hand back, dropping hop-by-hop
+/// headers, rewriting redirects into the proxy's namespace, and stamping the
+/// framing policy the preview panels rely on.
+fn collect_out_headers(resp_headers: &HeaderMap, is_html: bool, port: u16, proxy_base: &str) -> Vec<(String, String)> {
+    let mut out_headers = Vec::new();
+
+    for (name, value) in resp_headers.iter() {
+        let name_str = name.as_str().to_lowercase();
+
+        if is_hop_by_hop(&name_str) {
+            continue;
+        }
+
+        if name_str == "location"
+            && let Ok(loc) = value.to_str()
+        {
+            let rewritten = rewrite_location(loc, port, proxy_base);
+            out_headers.push(("location".to_owned(), rewritten));
+            continue;
+        }
+
+        // An injected guard changes the length; a streamed body has none at all.
+        if is_html && name_str == "content-length" {
+            continue;
+        }
+
+        if let Ok(val_str) = value.to_str() {
+            out_headers.push((name_str, val_str.to_owned()));
+        }
+    }
+
+    out_headers.push(("x-frame-options".to_owned(), "SAMEORIGIN".to_owned()));
+    out_headers
 }
 
 fn is_html_content_type(headers: &HeaderMap) -> bool {
@@ -534,5 +732,16 @@ mod tests {
         assert!(guard.contains("history.replaceState"));
         assert!(guard.contains("location,'href'"));
         assert!(guard.contains("addEventListener('click'"));
+    }
+
+    // The watch page opens `/events` with a root-absolute path. Without these
+    // rewrites the stream resolves against the app origin, 404s, and the preview
+    // never receives another update.
+    #[test]
+    fn navigation_guard_rewrites_request_urls() {
+        let guard = NAVIGATION_GUARD_TEMPLATE;
+        assert!(guard.contains("window.EventSource"), "EventSource must be wrapped");
+        assert!(guard.contains("XMLHttpRequest.prototype.open"), "XHR must be wrapped");
+        assert!(guard.contains("window.fetch"), "fetch must be wrapped");
     }
 }

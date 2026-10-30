@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use aionui_api_types::WebSocketMessage;
 use aionui_office::OfficeError;
-use aionui_office::proxy::{ProxyError, ProxyService};
+use aionui_office::proxy::{ProxyError, ProxyService, RenderState};
 use aionui_office::types::DocType;
 use aionui_office::watch_manager::{OfficecliWatchManager, ProcessHandle, ProcessSpawner};
 use aionui_realtime::EventBroadcaster;
@@ -493,4 +493,78 @@ async fn proxy_forwards_404_status() {
     let result = proxy.forward(port, "/missing", DocType::Word, &[]).await.unwrap();
 
     assert_eq!(result.status, 404);
+}
+
+// ---------------------------------------------------------------------------
+// Render-state probe: distinguishes a rendered document from officecli's
+// "waiting for the first update" page, which is what a failed first render
+// leaves behind.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn render_state_reports_placeholder_page() {
+    let html = "<html><body><div class=\"msg\"><h2>Waiting for first update...</h2>\
+                <p>Run an officecli command to see the preview.</p></div></body></html>";
+    let response = build_http_response(200, &[("Content-Type", "text/html")], html);
+    let (proxy, port, _dir) = setup_proxy(DocType::Word, &response).await;
+
+    assert_eq!(proxy.render_state(port).await, RenderState::Placeholder);
+}
+
+#[tokio::test]
+async fn render_state_reports_rendered_document() {
+    let html = "<html><body><h1>Quarterly report</h1><p>Body text.</p></body></html>";
+    let response = build_http_response(200, &[("Content-Type", "text/html")], html);
+    let (proxy, port, _dir) = setup_proxy(DocType::Word, &response).await;
+
+    assert_eq!(proxy.render_state(port).await, RenderState::Rendered);
+}
+
+#[tokio::test]
+async fn render_state_is_unknown_when_the_page_fails() {
+    let response = build_http_response(500, &[("Content-Type", "text/plain")], "boom");
+    let (proxy, port, _dir) = setup_proxy(DocType::Word, &response).await;
+
+    assert_eq!(proxy.render_state(port).await, RenderState::Unknown);
+}
+
+// ---------------------------------------------------------------------------
+// Event streams: forwarded chunk-by-chunk, never buffered into a blob.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn event_stream_is_streamed_to_the_caller() {
+    use futures_util::StreamExt;
+
+    let payload = "data: {\"type\":\"doc-switched\"}\n\n";
+    let response = build_http_response(200, &[("Content-Type", "text/event-stream")], payload);
+    let (proxy, port, _dir) = setup_proxy(DocType::Word, &response).await;
+
+    let stream = proxy
+        .forward_watch_event_stream_for_user("system_default_user", port, "/events", &[])
+        .await
+        .unwrap();
+
+    assert_eq!(stream.status, 200);
+    let header_names: Vec<&str> = stream.headers.iter().map(|(k, _)| k.as_str()).collect();
+    assert!(header_names.contains(&"x-frame-options"));
+
+    let mut collected = Vec::new();
+    let mut body = stream.body;
+    while let Some(chunk) = body.next().await {
+        collected.extend_from_slice(&chunk.unwrap());
+    }
+    assert_eq!(String::from_utf8(collected).unwrap(), payload);
+}
+
+#[tokio::test]
+async fn event_stream_rejects_inactive_port() {
+    let (proxy, _port, _dir) = setup_ssrf_proxy(DocType::Word).await;
+
+    let err = proxy
+        .forward_watch_event_stream_for_user("system_default_user", 9999, "/events", &[])
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, ProxyError::PortNotActive(9999)));
 }

@@ -17,6 +17,10 @@ const POLL_INTERVAL_MS: u64 = 100;
 const POLL_MAX_ATTEMPTS: u32 = 150;
 const START_PORT_MAX_ATTEMPTS: usize = 3;
 const STOP_DELAY_MS: u64 = 500;
+/// Budget for `officecli close` while releasing the resident lock. A live
+/// resident flushes in well under a second; anything slower is a stuck process
+/// and must not hold the preview start hostage.
+const OFFICECLI_CLOSE_TIMEOUT: Duration = Duration::from_secs(10);
 const VERSION_CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
 // ---------------------------------------------------------------------------
@@ -37,6 +41,22 @@ pub trait ProcessSpawner: Send + Sync {
     async fn is_officecli_installed(&self) -> bool;
 
     async fn check_update(&self, doc_type: DocType) -> Result<(), OfficeError>;
+
+    /// Drop any lock officecli itself still holds on `file_path`.
+    ///
+    /// officecli keeps one in-memory resident per document (a `__resident-serve__`
+    /// child) and that resident holds the file open, so a `watch` started while it
+    /// is alive cannot read the document: officecli logs "initial render failed"
+    /// and serves a placeholder page instead, and it never retries on its own (it
+    /// only re-renders on its *own* edits — external ones are not detected). The
+    /// tab then stays blank for as long as it is open.
+    ///
+    /// `close` is what officecli's own docs prescribe before "a non-officecli
+    /// program reads the file": it flushes pending edits to disk, then releases
+    /// the file. Best-effort by design — no resident, an older officecli without
+    /// the subcommand, or a lock owned by another application must not fail the
+    /// preview; the render check after startup reports anything that still fails.
+    async fn release_document_lock(&self, _file_path: &str) {}
 }
 
 pub trait ProcessHandle: Send + Sync {
@@ -113,6 +133,13 @@ impl OfficecliWatchManager {
 
         self.broadcast_status_for_user(user_id, doc_type, PreviewState::Starting, None);
 
+        // The preview reads the document from disk, so officecli's own resident has
+        // to let go of it first — see `release_document_lock`. Doing it before every
+        // start (not only when a lock is suspected) is what makes "open the preview
+        // right after the agent saved the file" work: that is exactly the case where
+        // the resident is still alive.
+        self.spawner.release_document_lock(&resolved).await;
+
         let result = self.try_start(user_id, &resolved, doc_type).await;
 
         match &result {
@@ -135,6 +162,7 @@ impl OfficecliWatchManager {
                     OfficeError::InstallFailed(m) => OfficeError::InstallFailed(m.clone()),
                     OfficeError::StartFailed(m) => OfficeError::StartFailed(m.clone()),
                     OfficeError::PortTimeout(m) => OfficeError::PortTimeout(m.clone()),
+                    OfficeError::RenderFailed(m) => OfficeError::RenderFailed(m.clone()),
                     OfficeError::Io(io) => OfficeError::StartFailed(format!("IO error: {io}")),
                     OfficeError::Snapshot(m) => OfficeError::StartFailed(m.clone()),
                     OfficeError::Json(e) => OfficeError::StartFailed(format!("JSON error: {e}")),
@@ -435,6 +463,45 @@ impl ProcessSpawner for DefaultProcessSpawner {
         }))
     }
 
+    /// Run `officecli close <file>` so officecli's resident flushes its edits and
+    /// releases the document before the preview process reads it.
+    ///
+    /// Everything here is best-effort: the resident may not exist, the file may be
+    /// held by another application, or an older officecli may not expose `close`.
+    /// None of that is worth failing a preview over, because the render check after
+    /// startup reports the cases that actually matter.
+    async fn release_document_lock(&self, file_path: &str) {
+        let Some(officecli) = resolve_officecli_path() else {
+            // Reported by `spawn_officecli`, which knows the install path.
+            return;
+        };
+
+        let mut builder = CmdBuilder::clean_cli(&officecli);
+        builder.arg("close").arg(file_path);
+
+        match tokio::time::timeout(OFFICECLI_CLOSE_TIMEOUT, builder.output()).await {
+            Ok(Ok(output)) if output.status.success() => {
+                tracing::debug!(file_path, "released officecli resident lock before preview");
+            }
+            Ok(Ok(output)) => {
+                // Also the path a Word/WPS/antivirus lock takes. The preview may
+                // still render, so this stays a hint rather than a failure.
+                tracing::debug!(
+                    file_path,
+                    status = ?output.status.code(),
+                    stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+                    "officecli close did not succeed; continuing"
+                );
+            }
+            Ok(Err(error)) => {
+                tracing::debug!(file_path, %error, "could not run officecli close; continuing");
+            }
+            Err(_) => {
+                tracing::warn!(file_path, "officecli close timed out; continuing");
+            }
+        }
+    }
+
     async fn install_officecli(&self) -> Result<(), OfficeError> {
         let command = install_command();
         tracing::info!(
@@ -607,6 +674,8 @@ mod tests {
         spawn_count: AtomicU32,
         install_count: AtomicU32,
         update_count: AtomicU32,
+        release_count: AtomicU32,
+        released_before_spawn: AtomicBool,
         fail_spawn: AtomicBool,
         fail_with_address_in_use_once: AtomicBool,
         start_listener: AtomicBool,
@@ -619,6 +688,8 @@ mod tests {
                 spawn_count: AtomicU32::new(0),
                 install_count: AtomicU32::new(0),
                 update_count: AtomicU32::new(0),
+                release_count: AtomicU32::new(0),
+                released_before_spawn: AtomicBool::new(false),
                 fail_spawn: AtomicBool::new(false),
                 fail_with_address_in_use_once: AtomicBool::new(false),
                 start_listener: AtomicBool::new(true),
@@ -635,6 +706,9 @@ mod tests {
             _doc_type: DocType,
         ) -> Result<Box<dyn ProcessHandle>, OfficeError> {
             self.spawn_count.fetch_add(1, Ordering::SeqCst);
+            if self.release_count.load(Ordering::SeqCst) > 0 {
+                self.released_before_spawn.store(true, Ordering::SeqCst);
+            }
 
             if self.fail_spawn.load(Ordering::SeqCst) {
                 return Err(OfficeError::StartFailed("mock spawn failure".into()));
@@ -670,6 +744,10 @@ mod tests {
         async fn check_update(&self, _doc_type: DocType) -> Result<(), OfficeError> {
             self.update_count.fetch_add(1, Ordering::SeqCst);
             Ok(())
+        }
+
+        async fn release_document_lock(&self, _file_path: &str) {
+            self.release_count.fetch_add(1, Ordering::SeqCst);
         }
     }
 
@@ -785,6 +863,28 @@ mod tests {
         assert!(port > 0);
         assert_eq!(mgr.active_session_count(), 1);
         assert_eq!(spawner.spawn_count.load(Ordering::SeqCst), 1);
+    }
+
+    // A resident that still holds the file makes officecli's first render fail,
+    // and that failure never repairs itself: the preview only re-renders on its
+    // own edits. The lock has to be released before `watch` is even spawned.
+    #[tokio::test]
+    async fn start_releases_the_document_lock_before_spawning() {
+        let spawner = Arc::new(MockSpawner::new());
+        let broadcaster = Arc::new(RecordingBroadcaster::new());
+        let mgr = make_manager(Arc::clone(&spawner), Arc::clone(&broadcaster));
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("test.docx");
+        std::fs::write(&file, b"test").unwrap();
+
+        mgr.start(file.to_str().unwrap(), DocType::Word).await.unwrap();
+
+        assert_eq!(spawner.release_count.load(Ordering::SeqCst), 1);
+        assert!(
+            spawner.released_before_spawn.load(Ordering::SeqCst),
+            "the lock must be released before the watch process starts"
+        );
     }
 
     #[tokio::test]
