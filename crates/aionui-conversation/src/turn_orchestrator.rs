@@ -145,8 +145,8 @@ impl ConversationTurnOrchestrator {
         // Follow the account THIS conversation runs as, which is not
         // necessarily the library-wide active one: an explicit binding wins,
         // otherwise the conversation has been following the active account.
-        let previous = codebuddy_account_id_from_build_options(build_options)
-            .or_else(|| store.active().map(|account| account.id));
+        let previous =
+            codebuddy_account_id_from_build_options(build_options).or_else(|| store.active().map(|account| account.id));
         let next = store.next_usable_account_excluding(previous.as_deref(), now_ms())?;
 
         // Bind the conversation, not the library. Moving the global active
